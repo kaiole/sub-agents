@@ -3,8 +3,10 @@ import { existsSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { readJson, writeJson, type Activity, type Completion, type Control, type Launch, type Mail } from "./shared.ts";
+import { Type } from "typebox";
+import { readJson, writeJson, type Activity, type Completion, type Control, type Launch, type Mail, type WaitingFor } from "./shared.ts";
 import { Tmux } from "./tmux.ts";
+import { readActivity } from "./health.ts";
 
 /** Runs inside the worker's actual interactive Pi process. No stdin/send-keys automation. */
 export function childExtension(pi: ExtensionAPI, run: string): void {
@@ -13,11 +15,18 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
   let ctx: ExtensionContext;
   let timer: ReturnType<typeof setInterval> | undefined;
   let closing = false;
-  let idle = launch.inspection || readJson<Activity>(join(run, "activity.json"))?.status === "waiting";
+  const previousActivity = readActivity(join(run, "activity.json"));
+  let idle = launch.inspection || previousActivity?.status === "waiting";
   let lastAssistant: AssistantMessage | undefined;
   let outcome: "completed" | "error" | "aborted" = "completed";
-  let status: Activity["status"] = "starting";
-  let detail = "loading";
+  let status: Activity["status"] = previousActivity?.status ?? "starting";
+  let detail = previousActivity?.detail ?? "loading";
+  let activitySince = previousActivity?.since ?? Date.now();
+  let waitingFor: WaitingFor | undefined = previousActivity?.waitingFor;
+  const activeTools = new Set([...launch.loadout.tools, "ask_question"]);
+  const toolsInFlight = new Map<string, string>();
+  const questionFile = join(run, "question.json");
+  let pendingQuestion = readJson<{ question: string }>(questionFile)?.question;
   let lastHeartbeat = 0;
   let lastKeepOpen: boolean | undefined;
   let usage: Completion["usage"] = emptyUsage();
@@ -30,18 +39,29 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
     lastHeartbeat = Date.now();
     lastKeepOpen = control().keepOpen;
     writeJson(join(run, "activity.json"), {
-      status, detail, pid: process.pid, sessionFile: ctx.sessionManager.getSessionFile(), updatedAt: lastHeartbeat, keepOpen: lastKeepOpen,
+      status, detail, since: activitySince, waitingFor,
+      pid: process.pid, sessionFile: ctx.sessionManager.getSessionFile(), updatedAt: lastHeartbeat, keepOpen: lastKeepOpen,
     } satisfies Activity);
     ctx.ui.setStatus("subagent", `${launch!.name} · ${lastKeepOpen ? "kept open" : "auto-exit"}`);
   }
-  function activity(next: Activity["status"], text: string): void {
+  function activity(next: Activity["status"], text: string, reason?: WaitingFor): void {
+    if (status !== next || detail !== text || waitingFor !== reason) activitySince = Date.now();
     status = next;
     detail = text;
+    waitingFor = reason;
     heartbeat();
   }
-  function complete(resultStatus: Completion["status"], text: string): void {
+  function modelActivity(): void {
+    if (waitingFor === "human-input") return;
+    activity("active", toolsInFlight.size ? [...new Set(toolsInFlight.values())].join(", ") : "model");
+  }
+  function clearQuestion(): void {
+    pendingQuestion = undefined;
+    if (existsSync(questionFile)) unlinkSync(questionFile);
+  }
+  function complete(resultStatus: Completion["status"], text: string, question?: string): void {
     const result: Completion = {
-      id: randomUUID(), status: resultStatus, text, usage,
+      id: randomUUID(), status: resultStatus, text, question, usage,
       sessionFile: ctx.sessionManager.getSessionFile(), completedAt: Date.now(),
     };
     // An outbox preserves every completion even if multiple fast turns settle between parent polls.
@@ -61,6 +81,7 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
       const mail = readJson<Mail>(file);
       if (!mail || typeof mail.message !== "string" || !mail.message.trim()) throw new Error(`Invalid mailbox message: ${file}`);
       // sendUserMessage always triggers a turn when idle and queues steering while busy.
+      clearQuestion();
       pi.sendUserMessage(mail.message, { deliverAs: "steer", expandPromptTemplates: false });
       unlinkSync(file);
       idle = false;
@@ -98,11 +119,18 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
       stop();
       return;
     }
-    pi.setActiveTools(launch.loadout.tools);
-    activity(launch.inspection ? "waiting" : "starting", launch.inspection ? "inspection" : "ready");
+    pi.setActiveTools([...activeTools]);
+    if (idle) {
+      activity("waiting", pendingQuestion ? "clarification" : launch.inspection ? "inspection" : previousActivity?.detail ?? "finished",
+        pendingQuestion ? "clarification" : launch.inspection ? "inspection" : previousActivity?.waitingFor ?? "release");
+    } else activity("starting", "ready");
     timer = setInterval(tick, 250);
   });
-  pi.on("before_agent_start", () => { pi.setActiveTools(launch.loadout.tools); });
+  pi.on("input", () => { clearQuestion(); });
+  pi.on("before_agent_start", () => { pi.setActiveTools([...activeTools]); });
+  pi.on("tool_call", () => {
+    if (pendingQuestion) return { block: true, terminate: true, reason: "A clarification is pending. Wait for the parent's reply before using more tools." };
+  });
   // Session replacement would disconnect the worker from its recorded identity and mailbox.
   pi.on("session_before_switch", () => ({ cancel: true }));
   pi.on("session_before_fork", () => ({ cancel: true }));
@@ -112,12 +140,13 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
     lastAssistant = undefined;
     usage = emptyUsage();
     outcome = "completed";
+    toolsInFlight.clear();
     activity("active", "model");
   });
-  pi.on("tool_execution_start", (event) => { activity("active", event.toolName); });
-  pi.on("tool_execution_end", () => { activity("active", "model"); });
-  pi.on("ui_prompt_start", (event) => { activity("waiting", event.title ?? event.kind); });
-  pi.on("ui_prompt_end", () => { activity("active", "model"); });
+  pi.on("tool_execution_start", (event) => { toolsInFlight.set(event.toolCallId, event.toolName); modelActivity(); });
+  pi.on("tool_execution_end", (event) => { toolsInFlight.delete(event.toolCallId); modelActivity(); });
+  pi.on("ui_prompt_start", (event) => { activity("waiting", event.title ?? event.kind, "human-input"); });
+  pi.on("ui_prompt_end", () => { waitingFor = undefined; modelActivity(); });
   pi.on("message_end", (event) => {
     const message = event.message;
     if (message.role === "assistant") lastAssistant = message;
@@ -133,10 +162,13 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
   pi.on("agent_settled", () => {
     if (closing) return;
     const text = lastAssistant?.content.filter((part) => part.type === "text").map((part) => part.text).join("\n") ?? "";
-    const resultStatus = outcome === "aborted" ? "cancelled" : outcome === "error" ? "error" : "done";
-    complete(resultStatus, lastAssistant?.errorMessage || text || (resultStatus === "done" ? "(No final text.)" : `Worker ${resultStatus}.`));
+    const resultStatus = outcome === "aborted" ? "cancelled" : outcome === "error" ? "error" : pendingQuestion ? "needs-input" : "done";
+    complete(resultStatus, resultStatus === "needs-input" ? pendingQuestion! :
+      lastAssistant?.errorMessage || text || (resultStatus === "done" ? "(No final text.)" : `Worker ${resultStatus}.`),
+      resultStatus === "needs-input" ? pendingQuestion : undefined);
     idle = true;
-    activity("waiting", resultStatus === "done" ? "finished" : resultStatus);
+    activity("waiting", resultStatus === "needs-input" ? "clarification" : resultStatus === "done" ? "finished" : resultStatus,
+      resultStatus === "needs-input" ? "clarification" : resultStatus === "cancelled" ? "human-input" : "release");
     // After an interactive Escape/abort, leave the live TUI available for recovery.
     if (resultStatus === "cancelled") writeJson(join(run, "control.json"), { keepOpen: true });
     // Do not shut down synchronously in the settlement callback. Drain any racing messages first.
@@ -146,6 +178,25 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
     timer = undefined;
     if (!closing && !idle && event.reason !== "reload") complete("cancelled", "Worker exited before completing its task.");
     closing = true;
+  });
+
+  pi.registerTool({
+    name: "ask_question", label: "Ask parent",
+    exposure: "model-only", executionMode: "sequential",
+    description: "Request a clarification from the parent instead of guessing. Your task becomes needs-input; your session is saved and normally exits. The parent replies via subagent_message and you resume the same conversation. Use this tool alone, then stop.",
+    promptGuidelines: ["When blocked by missing requirements or a material decision, ask the parent rather than guess. Call ask_question alone, not alongside other tools. Do not continue until the parent's reply."],
+    parameters: Type.Object({ question: Type.String({ minLength: 1, maxLength: 8000, description: "One actionable question with enough context for the parent to answer." }) }),
+    async execute(_id, params) {
+      const question = params.question.trim();
+      if (!question) throw new Error("A nonempty clarification question is required.");
+      if (pendingQuestion) throw new Error("A clarification is already pending.");
+      pendingQuestion = question;
+      writeJson(questionFile, { question });
+      return {
+        content: [{ type: "text", text: "Clarification requested. Stop and wait; the parent's reply will resume this saved conversation." }],
+        details: { question }, terminate: true,
+      };
+    },
   });
 
   pi.registerCommand("subagents", {

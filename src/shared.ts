@@ -5,13 +5,18 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 
 export const CHILD_ENV = "PI_BACKGROUND_SUBAGENT_RUN";
 export const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"]);
-export type Status = "starting" | "active" | "waiting" | "done" | "error" | "cancelled";
+export type Status = "starting" | "active" | "waiting" | "needs-input" | "done" | "error" | "cancelled";
+export type WaitingFor = "human-input" | "clarification" | "inspection" | "release";
+export type Health = "healthy" | "stalled";
+
+export interface PreloadedSkill { name: string; path: string; content: string }
 
 export interface Loadout {
   agent: string;
   tools: string[];
   extensions: string[];
   systemPrompt: string;
+  skills?: PreloadedSkill[];
   model?: string;
   thinking: ThinkingLevel;
   cwd: string;
@@ -27,6 +32,9 @@ export interface Job {
   run: string;
   task: string;
   startedAt: number;
+  finishedAt?: number;
+  lastHeartbeatAt?: number;
+  health?: Health;
   windowId?: string;
   paneId?: string;
   status: Status;
@@ -42,11 +50,14 @@ export interface Launch {
   parentPane?: string;
   mailbox: string;
   inspection: boolean;
+  inspectionStatus?: Status;
 }
 
 export interface Activity {
   status: "starting" | "active" | "waiting";
   detail: string;
+  since?: number;
+  waitingFor?: WaitingFor;
   pid: number;
   sessionFile?: string;
   updatedAt: number;
@@ -55,8 +66,9 @@ export interface Activity {
 
 export interface Completion {
   id: string;
-  status: "done" | "error" | "cancelled";
+  status: "done" | "error" | "cancelled" | "needs-input";
   text: string;
+  question?: string;
   sessionFile?: string;
   completedAt: number;
   usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };

@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { CHILD_ENV, readJson, runFile, uniqueName, writeJson, type Activity, type Completion, type Control, type Job, type Launch, type Loadout } from "./shared.ts";
+import { CHILD_ENV, readJson, runFile, uniqueName, writeJson, type Completion, type Control, type Job, type Launch, type Loadout } from "./shared.ts";
 import { piInvocation, quote, Tmux, type Pane } from "./tmux.ts";
+import { heartbeatHealth, readActivity } from "./health.ts";
+import { renderPreloadedSkills } from "./skills.ts";
 
 interface Registry { version: 1; jobs: Job[] }
 export interface ManagerOptions {
@@ -13,6 +15,9 @@ export interface ManagerOptions {
   tmux?: Tmux;
   invocation?: (args: string[]) => string[];
   onResult: (job: Job, result: Completion) => void;
+  onHealth?: (job: Job, transition: "stalled" | "recovered") => void;
+  staleAfterMs?: number;
+  now?: () => number;
 }
 
 export class Manager {
@@ -31,6 +36,7 @@ export class Manager {
     }
   }
 
+  private now(): number { return (this.options.now ?? Date.now)(); }
   private save(): void { writeJson(this.registryFile, { version: 1, jobs: [...this.jobs.values()] } satisfies Registry); }
   private mailbox(job: Job): string { return join(job.directory, "mailbox"); }
   private hasMail(job: Job): boolean { return readdirSync(this.mailbox(job)).some((name) => name.endsWith(".json")); }
@@ -48,7 +54,7 @@ export class Manager {
   }
   private reportFailure(job: Job, text: string, sessionFile?: string): void {
     const failure: Completion = {
-      id: randomUUID(), status: "error", completedAt: Date.now(), text, sessionFile,
+      id: randomUUID(), status: "error", completedAt: this.now(), text, sessionFile,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     };
     const file = runFile(job, "result.json");
@@ -76,16 +82,20 @@ export class Manager {
     const launch: Launch = {
       name: job.name, sessionId: job.sessionId, loadout: job.loadout,
       parentPane: this.options.parentPane, mailbox: this.mailbox(job), inspection,
+      inspectionStatus: inspection ? job.status : undefined,
     };
     writeJson(join(run, "launch.json"), launch);
     writeJson(join(run, "control.json"), { keepOpen } satisfies Control);
+    if (inspection && job.status === "needs-input" && job.result?.status === "needs-input" && job.result.question) {
+      writeJson(join(run, "question.json"), { question: job.result.question });
+    }
     const promptFile = join(job.directory, "system-prompt.md");
-    writeFileSync(promptFile, `${job.loadout.systemPrompt}\n\nYou are the ${job.name} subagent. Complete the delegated task and end with a concise, useful result. Your final response will be returned to the parent. You share the working tree with the parent; avoid unrelated edits.\n`, { mode: 0o600 });
+    writeFileSync(promptFile, `${job.loadout.systemPrompt}\n\n${renderPreloadedSkills(job.loadout.skills)}\n\nYou are the ${job.name} subagent. Complete the delegated task and end with a concise, useful result. Your final response will be returned to the parent. If missing requirements or a material decision block your work, call ask_question alone and stop instead of guessing. The parent will answer by resuming your saved conversation. You share the working tree with the parent; avoid unrelated edits.\n`, { mode: 0o600 });
     const args = [
       "--session-id", job.sessionId, "--session-dir", join(job.directory, "sessions"),
       "--name", `subagent:${job.name}`, "--no-extensions", "--no-prompt-templates",
       "-e", this.options.extensionPath,
-      "--tools", job.loadout.tools.join(","), "--thinking", job.loadout.thinking,
+      "--tools", [...new Set([...job.loadout.tools, "ask_question"])].join(","), "--thinking", job.loadout.thinking,
       "--append-system-prompt", promptFile,
       job.loadout.approveProject ? "--approve" : "--no-approve",
     ];
@@ -108,7 +118,10 @@ export class Manager {
     ].join("\n"), { mode: 0o700 });
     job.run = run;
     job.status = "starting";
-    job.startedAt = Date.now();
+    job.startedAt = this.now();
+    job.finishedAt = undefined;
+    job.lastHeartbeatAt = undefined;
+    job.health = undefined;
     job.windowId = undefined;
     job.paneId = undefined;
     this.save();
@@ -131,7 +144,7 @@ export class Manager {
     const job: Job = {
       id, sessionId: randomUUID(), name: uniqueName(name, this.jobs.keys()),
       directory: join(this.options.directory, id), loadout, run: "", task,
-      startedAt: Date.now(), status: "starting",
+      startedAt: this.now(), status: "starting",
     };
     this.jobs.set(job.name, job);
     mkdirSync(this.mailbox(job), { recursive: true, mode: 0o700 });
@@ -178,7 +191,7 @@ export class Manager {
         writeJson(runFile(job, "control.json"), { keepOpen: true } satisfies Control);
         // Wait for the child to acknowledge the pin. If auto-exit already started, wait
         // for the old process to disappear and reopen its saved session, never two writers.
-        if (readJson<Activity>(runFile(job, "activity.json"))?.keepOpen) {
+        if (readActivity(runFile(job, "activity.json"))?.keepOpen) {
           this.tmux.open(job.paneId!);
           return job;
         }
@@ -198,7 +211,7 @@ export class Manager {
     const job = this.get(name);
     let pane = this.pane(job, this.tmux.panes());
     if (!pane || pane.dead) {
-      if (this.hasMail(job)) job.status = "cancelled";
+      if (this.hasMail(job) || job.status === "needs-input") job.status = "cancelled";
       this.clearMail(job);
       this.save();
       return;
@@ -223,6 +236,7 @@ export class Manager {
   refresh(): void {
     if (!this.jobs.size) return;
     const panes = this.tmux.panes();
+    const now = this.now();
     let changed = false;
     const restart: Job[] = [];
     for (const job of this.jobs.values()) {
@@ -239,26 +253,52 @@ export class Manager {
           }
         }
       }
-      const activity = readJson<Activity>(runFile(job, "activity.json"));
+      const activity = readActivity(runFile(job, "activity.json"));
       const exit = readJson<{ exitCode: number }>(runFile(job, "exit.json"));
       if (result) this.deliver(job, result, runFile(job, "result.json"));
       const before = job.status;
+      const inspectionLaunch = !result ? readJson<Launch>(runFile(job, "launch.json")) : undefined;
+      const inspectionExit = !result && exit?.exitCode === 0 && inspectionLaunch?.inspection;
       const cancelling = readJson<Control>(runFile(job, "control.json"))?.cancel;
       if (cancelling) job.status = "cancelled";
-      else if (pane && !pane.dead && !exit) job.status = activity?.status ?? "starting";
-      else {
+      else if (pane && !pane.dead && !exit) {
+        // Merely inspecting history must not reactivate an explicitly cancelled task.
+        job.status = inspectionLaunch?.inspectionStatus === "cancelled" && activity?.waitingFor === "inspection" ? "cancelled" :
+          activity?.waitingFor === "clarification" && job.result?.status === "needs-input" ? "needs-input" : activity?.status ?? job.status;
+        if (activity && job.lastHeartbeatAt !== activity.updatedAt) {
+          job.lastHeartbeatAt = activity.updatedAt;
+          changed = true;
+        }
+        const health = heartbeatHealth(job.lastHeartbeatAt ?? job.startedAt, now, this.options.staleAfterMs);
+        const beforeHealth = job.health;
+        job.health = health;
+        changed ||= beforeHealth !== health;
+        if (health !== beforeHealth && (health === "stalled" || beforeHealth === "stalled")) {
+          // Persist transition state before waking the parent, avoiding repeated reload alerts.
+          this.save();
+          this.options.onHealth?.(job, health === "stalled" ? "stalled" : "recovered");
+        }
+      } else {
         if (pane?.dead) this.tmux.kill(pane.paneId);
         if (job.status !== "cancelled") {
-          if (exit?.exitCode === 0 && activity?.detail === "inspection") job.status = job.result?.status ?? "done";
-          else if (result && activity?.status === "waiting") job.status = result.status;
+          if (inspectionExit) job.status = inspectionLaunch?.inspectionStatus ?? job.result?.status ?? "done";
+          else if (result && (exit?.exitCode === 0 || activity?.status === "waiting")) job.status = result.status;
           else if (exit || !pane) job.status = "error";
         }
-        if (job.status === "error" && (!result || result.status !== "error") && before !== "error") {
+        if (!inspectionExit && job.status === "error" && (!result || result.status !== "error") && before !== "error") {
           this.reportFailure(job, `Worker exited unexpectedly${exit ? ` (exit ${exit.exitCode})` : " (tmux pane disappeared)"}. Launch artifacts: ${job.run}`, activity?.sessionFile);
         }
         // A steering message can arrive just as an auto-exiting worker shuts down.
         // Durable mail survives that race and resumes the same session, never a second writer.
-        if (job.status === "done" && this.hasMail(job)) restart.push(job);
+        if (["done", "needs-input"].includes(job.status) && this.hasMail(job)) restart.push(job);
+      }
+      if ((!pane || pane.dead || exit) && job.finishedAt === undefined) {
+        job.finishedAt = result && result.completedAt >= job.startedAt ? result.completedAt : now;
+        changed = true;
+      }
+      if ((!pane || pane.dead || exit || cancelling) && job.health !== undefined) {
+        job.health = undefined;
+        changed = true;
       }
       changed ||= before !== job.status;
     }
@@ -273,9 +313,12 @@ export class Manager {
 
   list(): Array<Record<string, unknown>> {
     this.refresh();
+    const panes = this.tmux.panes();
+    const now = this.now();
     return [...this.jobs.values()].map((job) => {
-      const activity = readJson<Activity>(runFile(job, "activity.json"));
-      const live = ["starting", "active", "waiting"].includes(job.status);
+      const activity = readActivity(runFile(job, "activity.json"));
+      const pane = this.pane(job, panes);
+      const live = !!pane && !pane.dead && !readJson(runFile(job, "exit.json"));
       let rssMiB: number | undefined;
       if (live && activity?.pid) {
         try {
@@ -284,8 +327,14 @@ export class Manager {
         } catch { /* Memory statistics are optional and Linux-specific. */ }
       }
       return {
-        name: job.name, agent: job.loadout.agent, status: job.status,
+        name: job.name, agent: job.loadout.agent, status: job.status, live,
         activity: live ? activity?.detail : undefined,
+        elapsedMs: Math.max(0, (job.finishedAt ?? now) - job.startedAt),
+        activityDurationMs: live && activity ? Math.max(0, now - (activity.since ?? activity.updatedAt)) : undefined,
+        health: live ? job.health : undefined,
+        heartbeatAgeMs: live ? Math.max(0, now - (job.lastHeartbeatAt ?? job.startedAt)) : undefined,
+        waitingFor: job.status === "needs-input" ? "clarification" : live ? activity?.waitingFor : undefined,
+        question: job.status === "needs-input" ? job.result?.question ?? job.result?.text : undefined,
         keepOpen: live ? readJson<Control>(runFile(job, "control.json"))?.keepOpen : false,
         pid: live ? activity?.pid : undefined, rssMiB,
         pane: live ? job.paneId : undefined, cwd: job.loadout.cwd,

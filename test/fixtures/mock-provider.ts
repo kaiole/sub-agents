@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, getCurrentSystemPrompt, getCurrentTools, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** Deterministic, offline provider used only by the real tmux/Pi integration test. */
@@ -25,6 +25,20 @@ export default function (pi: ExtensionAPI) {
           stream.push({ type: "start", partial: output });
           await delay(users.at(-1)?.includes("SLOW") ? 3000 : 100, undefined, { signal: options?.signal });
           if (users.at(-1)?.includes("ERROR")) throw new Error("Deliberate mock failure.");
+          if (users.at(-1)?.startsWith("QUESTION")) {
+            if (context.messages.at(-1)?.role === "toolResult") throw new Error("Clarification must terminate without another provider request.");
+            if (!getCurrentTools(context.messages).some((tool) => tool.name === "ask_question")) throw new Error("ask_question was not exposed.");
+            const toolCall = { type: "toolCall" as const, id: "clarification-call", name: "ask_question", arguments: { question: "Which storage backend should I use?" } };
+            output.content = [toolCall];
+            stream.push({ type: "toolcall_start", contentIndex: 0, partial: output });
+            stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: output });
+            output.stopReason = "toolUse";
+            stream.push({ type: "done", reason: "toolUse", message: output });
+            return;
+          }
+          if (users.at(-1)?.includes("SKILL_CHECK") && !getCurrentSystemPrompt(context.messages).includes("PRELOADED_SKILL_INSTRUCTIONS")) {
+            throw new Error("Skill instructions were not present in the initial system prompt.");
+          }
           stream.push({ type: "text_start", contentIndex: 0, partial: output });
           output.content[0] = { type: "text", text };
           stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });

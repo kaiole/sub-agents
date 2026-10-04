@@ -58,7 +58,7 @@ test("real Pi workers use background windows, complete, resume, inspect, steer, 
     maxConcurrent: 2, tmux, invocation: (args: string[]) => ["pi", "--offline", ...args],
     onResult: (_job: Job, result: Completion) => results.push(result),
   };
-  const manager = new Manager(options);
+  let manager = new Manager(options);
   const diagnose = (job: Job): string => {
     let screen = "(pane gone)";
     try { screen = tmux.command(["capture-pane", "-p", "-t", job.paneId!]); } catch { /* gone */ }
@@ -124,6 +124,64 @@ test("real Pi workers use background windows, complete, resume, inspect, steer, 
   restored.refresh();
   assert.equal(results.length, 5, "restoring registry must not redeliver results");
 
+  // Clarifications persist as needs-input, release their process/slot, and resume the same session.
+  const question = manager.spawn(loadout, "QUESTION about implementation", "clarification");
+  await completed(question, 6);
+  assert.equal(question.status, "needs-input", diagnose(question));
+  assert.equal(results.at(-1)?.question, "Which storage backend should I use?");
+  assert.equal(manager.list().find((job) => job.name === question.name)?.waitingFor, "clarification");
+  assert.equal(manager.list().find((job) => job.name === question.name)?.live, false);
+  await manager.open(question.name);
+  assert.equal(manager.list().find((job) => job.name === question.name)?.status, "needs-input");
+  assert.equal(manager.list().find((job) => job.name === question.name)?.live, true);
+  assert.equal(results.length, 6, "question inspection must not invoke the model or duplicate the request");
+  manager.release(question.name);
+  await completed(question, 6);
+  assert.equal(question.status, "needs-input", "inspection/release must preserve the pending clarification");
+  const questionSession = question.sessionId;
+  const afterQuestion = new Manager(options);
+  manager = afterQuestion;
+  afterQuestion.refresh();
+  assert.equal(afterQuestion.get(question.name).status, "needs-input");
+  assert.equal(results.length, 6, "question must not be redelivered after registry restoration");
+  afterQuestion.message(question.name, "Use SQLite.");
+  await waitFor(() => {
+    afterQuestion.refresh();
+    return results.length === 7 && !tmux.panes().some((pane) => pane.paneId === afterQuestion.get(question.name).paneId);
+  }, () => diagnose(afterQuestion.get(question.name)));
+  assert.equal(afterQuestion.get(question.name).sessionId, questionSession);
+  assert.equal(results.at(-1)?.status, "done");
+  assert.match(results.at(-1)!.text, /QUESTION about implementation \| Use SQLite\./);
+
+  // Preloaded skills arrive with the very first model request and survive follow-up launches.
+  const skilled = manager.spawn({ ...loadout, skills: [{ name: "test-skill", path: join(directory, "skills", "test-skill", "SKILL.md"), content: "PRELOADED_SKILL_INSTRUCTIONS" }] }, "SKILL_CHECK", "skilled");
+  await completed(skilled, 8);
+  assert.equal(results.at(-1)?.status, "done", diagnose(skilled));
+  manager.message(skilled.name, "SKILL_CHECK follow-up");
+  await completed(skilled, 9);
+  assert.equal(results.at(-1)?.status, "done", diagnose(skilled));
+  assert.match(results.at(-1)!.text, /SKILL_CHECK \| SKILL_CHECK follow-up/);
+
+  // Inspection must not resurrect a clarification that the parent explicitly cancelled.
+  const cancelledQuestion = manager.spawn(loadout, "QUESTION to cancel", "cancelled-question");
+  await completed(cancelledQuestion, 10);
+  await manager.cancel(cancelledQuestion.name);
+  assert.equal(cancelledQuestion.status, "cancelled");
+  await manager.open(cancelledQuestion.name);
+  const inspectedCancelled = manager.list().find((job) => job.name === cancelledQuestion.name)!;
+  assert.equal(inspectedCancelled.status, "cancelled");
+  assert.equal(inspectedCancelled.live, true);
+  assert.equal(inspectedCancelled.waitingFor, "inspection");
+  assert.equal(inspectedCancelled.question, undefined);
+  assert.equal(readJson(join(cancelledQuestion.run, "question.json")), undefined);
+  manager.release(cancelledQuestion.name);
+  await completed(cancelledQuestion, 10);
+  assert.equal(cancelledQuestion.status, "cancelled");
+  manager = new Manager(options);
+  manager.refresh();
+  assert.equal(manager.get(cancelledQuestion.name).status, "cancelled");
+  assert.equal(results.length, 10, "cancel/open/release/reload must not replay the historical question");
+
   // Exercise the parent factory/tool wiring too, with a real worker and captured Pi API calls.
   process.env.TMUX = `${tmux.command(["display-message", "-p", "-t", parentPane, "#{socket_path}"])},0,0`;
   process.env.TMUX_PANE = parentPane;
@@ -152,14 +210,35 @@ test("real Pi workers use background windows, complete, resume, inspect, steer, 
   assert.equal(handlers.has("session_start"), true);
   handlers.get("session_start")!({}, ctx);
   t.after(() => handlers.get("session_shutdown")?.({}, ctx));
-  const dispatched = await tools.get("subagent")!.execute("test-call", { agent: "worker", task: "parent delegated", name: "parent-worker" }, new AbortController().signal, undefined, ctx as any);
+  const dispatched = await tools.get("subagent")!.execute("test-call", { agent: "worker", task: "parent delegated", name: "parent-worker", keepOpen: true }, new AbortController().signal, undefined, ctx as any);
   assert.match((dispatched.content[0] as any).text, /asynchronously/);
   await waitFor(() => parentMessages.length === 1, () => JSON.stringify(parentMessages));
   assert.match(parentMessages[0].message.content, /Echo: parent delegated/);
   assert.deepEqual(parentMessages[0].options, { deliverAs: "followUp", triggerTurn: true });
+  const registry = readJson<{ jobs: Job[] }>(join(process.env.PI_CODING_AGENT_DIR!, "background-subagents", "parent-wiring", "registry.json"))!;
+  const parentWorker = registry.jobs.find((job) => job.name === "parent-worker")!;
+  const activityFile = join(parentWorker.run, "activity.json");
+  const healthyActivity = readJson<Activity>(activityFile)!;
+  writeJson(activityFile, { ...healthyActivity, updatedAt: Date.now() - 61_000 });
+  await tools.get("subagents_status")!.execute("stalled-call", {}, new AbortController().signal, undefined, ctx as any);
+  assert.equal(parentMessages[1].message.details.transition, "stalled");
+  assert.deepEqual(parentMessages[1].options, { deliverAs: "followUp", triggerTurn: true });
+  writeJson(activityFile, { ...healthyActivity, updatedAt: Date.now() });
+  await tools.get("subagents_status")!.execute("recovered-call", {}, new AbortController().signal, undefined, ctx as any);
+  assert.equal(parentMessages[2].message.details.transition, "recovered");
+  await commands.get("subagents").handler("release parent-worker", ctx);
+  await tools.get("subagent")!.execute("question-call", { agent: "worker", task: "QUESTION from parent", name: "parent-question" }, new AbortController().signal, undefined, ctx as any);
+  await waitFor(() => parentMessages.length === 4, () => JSON.stringify(parentMessages));
+  assert.equal(parentMessages[3].message.details.status, "needs-input");
+  assert.match(parentMessages[3].message.content, /not task completion/);
+  assert.match(parentMessages[3].message.content, /subagent_message\(\{ name: "parent-question"/);
+  assert.deepEqual(parentMessages[3].options, { deliverAs: "followUp", triggerTurn: true });
+  await tools.get("subagent_message")!.execute("answer-call", { name: "parent-question", message: "Use SQLite." }, new AbortController().signal, undefined, ctx as any);
+  await waitFor(() => parentMessages.length === 5, () => JSON.stringify(parentMessages));
+  assert.equal(parentMessages[4].message.details.status, "done");
   handlers.get("session_shutdown")!({}, ctx);
   handlers.get("session_start")!({}, ctx);
   await new Promise((resolve) => setTimeout(resolve, 1100));
-  assert.equal(parentMessages.length, 1, "parent reload must not redeliver completion");
+  assert.equal(parentMessages.length, 5, "parent reload must not redeliver completion, questions, or health transitions");
   handlers.get("session_shutdown")!({}, ctx);
 });

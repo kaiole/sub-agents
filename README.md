@@ -44,10 +44,28 @@ Workers survive parent quit, reload, and session switches. Their results are del
 | `subagent({ agent, task, name?, cwd?, model?, keepOpen? })` | Start asynchronously; duplicate names receive numeric suffixes |
 | `subagent_message({ name, message })` | Steer or resume the same task/session/loadout |
 | `subagents_list({})` | List profiles and configuration warnings |
-| `subagents_status({})` | Task status, activity, session/result paths, PID and Linux RSS |
+| `subagents_status({})` | Task status, questions/waiting reasons, run/activity durations, heartbeat health, session/result paths, PID and Linux RSS |
 | `subagent_cancel({ name })` | Cancel a live task |
 
 Results are queued as parent follow-ups, rather than interrupting its current turn. Long results are truncated in model context and linked to the full artifact. Worker token/cost usage is included in completion messages; it is separate from the parent's `/session` totals.
+
+## Clarification requests
+
+Every worker has an `ask_question({ question })` tool, in addition to its profile's tools. When requirements are missing or a material decision blocks the task, the worker can ask instead of guessing. It calls this tool **alone**, ending its turn without an extra model request.
+
+The question is saved as a durable `needs-input` result and sent to the parent as a follow-up, explicitly distinguished from task completion. The worker normally exits, freeing its concurrency slot while it waits. Explicitly kept-open/pinned workers remain available until released. Reply using the same task name:
+
+```text
+/subagents message worker Use SQLite; no external database service.
+```
+
+Or call `subagent_message({ name: "worker", message: "Use SQLite." })`. This resumes the same conversation and snapshotted loadout. Questions survive parent reload/quit, can be inspected with `/subagents list` or `/subagents result <name>`, and can be cancelled without starting a worker. An answer arriving during shutdown is preserved by the mailbox and resumed after the old process exits.
+
+## Activity and health
+
+The picker and `/subagents list` show elapsed time for the current/latest run, the current activity's duration, and an explicit waiting reason: human input, clarification, session inspection, or release of a finished kept-open worker. Elapsed time freezes when a run exits; a follow-up starts a new run timer. `subagents_status` exposes these durations in milliseconds, plus `live`, `health`, `heartbeatAgeMs`, `waitingFor`, and any pending `question`.
+
+A live worker with no fresh valid heartbeat for **60 seconds** is marked `stalled`; the parent receives one follow-up on that transition and another on recovery. This indicates missing monitoring/liveness evidence, not proof the task failed. A slow model request or long-running tool remains healthy while its heartbeat continues. Exited workers—including process-free clarification waits—do not generate stall alerts.
 
 ## Resource controls
 
@@ -85,15 +103,19 @@ Profiles are Markdown files in `~/.pi/agent/agents/` or the nearest trusted proj
 name: reviewer
 description: Focused read-only code review.
 tools: [read, grep, find, ls]
+# Optional: names of skills already enabled in the parent
+# skills: [code-review]
 thinking: low
 keep-open: false
 ---
 Review the delegated change. Cite concrete files and explain actionable issues.
 ```
 
-Supported fields: `name`, `description`, `tools` (array or comma-separated string), `model`, `thinking`, `cwd`, `keep-open`, and `extensions` (array or comma-separated paths). The body is appended to the system prompt. Model and thinking otherwise inherit from the parent. CWD resolves from the parent's working directory.
+Supported fields: `name`, `description`, `tools` (array or comma-separated string), `skills` (array or comma-separated names), `model`, `thinking`, `cwd`, `keep-open`, and `extensions` (array or comma-separated paths). The body is appended to the system prompt. Model and thinking otherwise inherit from the parent. CWD resolves from the parent's working directory.
 
-`auto-exit: false` is accepted as an alias for `keep-open: true`; `system-prompt: append` and `session-mode: standalone` are also accepted. This is **not** a full compatibility layer for pi-interactive-subagents: nested spawning, copied/lineage contexts, other CLIs, and its supervision-specific fields are not implemented. Clarification can be returned in the final response; the parent replies using `subagent_message`.
+`skills: [pdf-reading, research-methods]` preloads those skills into the worker's **initial system prompt**, without issuing skill-loading model turns. Names resolve against the parent's enabled skill resources, including package/custom locations and explicitly invoked-only skills. Missing/unreadable skills fail before spawning; untrusted project skills are not accepted. The skill body and source path are snapshotted with the loadout, so later follow-ups retain the original instructions even if the skill file changes or disappears. Relative references resolve from the original skill's directory, not the worker CWD. Supporting files/scripts themselves are not copied or frozen.
+
+`auto-exit: false` is accepted as an alias for `keep-open: true`; `system-prompt: append` and `session-mode: standalone` are also accepted. This is **not** a full compatibility layer for pi-interactive-subagents: nested spawning, copied/lineage contexts, other CLIs, and its supervision-specific profile fields are not implemented. Use `ask_question` for structured clarification; the parent replies using `subagent_message`.
 
 Only the extensions backing selected tools are loaded into a child, plus this package's worker controller. Backing extensions are resolved from the parent's tool source metadata. A profile can list additional `extensions`, resolved relative to its Markdown file; use this for a **custom model provider** or tools not loaded in the parent. Resume reuses the original loadout snapshot, not newly edited profile settings. Project resources are only approved automatically when the worker stays in the parent's already-trusted CWD.
 
@@ -114,7 +136,8 @@ Artifacts live under:
       launch.json             # resolved loadout (no environment credentials)
       launch.sh
       control.json
-      activity.json
+      activity.json           # heartbeat, activity age, waiting reason
+      question.json           # pending clarification, when present
       result.json             # latest completion
       results/                # durable completion outbox
       exit.json
@@ -132,4 +155,4 @@ npm run typecheck
 npm test
 ```
 
-The tests include real Pi TUI workers on an isolated tmux socket with an offline mock provider: no API calls, charges, or changes to your live tmux layout. They cover async completion, follow-ups, steering, inspection, cancellation, errors, loadout persistence, and parent notification wiring. Pi's host packages are peer dependencies and must be available for development.
+The tests include real Pi TUI workers on an isolated tmux socket with an offline mock provider: no API calls, charges, or changes to your live tmux layout. They cover async completion, clarification/answer round trips without extra model turns, preloaded skill startup/resume, follow-ups, steering, inspection, cancellation, errors, loadout persistence, and parent notification wiring. Deterministic unit tests cover skill discovery/trust/snapshots, activity timing, and heartbeat stall/recovery transitions. Pi's host packages are peer dependencies and must be available for development.

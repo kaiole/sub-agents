@@ -5,6 +5,7 @@ import { Type } from "typebox";
 import { discoverAgents, resolveLoadout } from "./src/agents.ts";
 import { childExtension } from "./src/child.ts";
 import { Manager } from "./src/manager.ts";
+import { formatDuration } from "./src/health.ts";
 import { CHILD_ENV, capOutput, type Completion, type Job } from "./src/shared.ts";
 
 const extensionPath = fileURLToPath(import.meta.url);
@@ -31,12 +32,31 @@ export default function (pi: ExtensionAPI): void {
 
   function notifyResult(job: Job, result: Completion): void {
     const artifact = job.resultFile ?? join(job.run, "result.json");
+    const replyHint = result.status === "needs-input"
+      ? `\n\nThis is a clarification request, not task completion. Reply with subagent_message({ name: "${job.name}", message: "your answer" }) to resume the saved conversation.` : "";
     pi.sendMessage({
       customType: "subagent-result",
-      content: `Subagent '${job.name}' (${job.loadout.agent}) ${result.status}.\n\n${capOutput(result.text, artifact)}\n\nSession: ${result.sessionFile ?? "not saved"}\nResult: ${artifact}\nWorker usage: ${result.usage.input} input / ${result.usage.output} output tokens; $${result.usage.cost.toFixed(4)}.`,
+      content: `Subagent '${job.name}' (${job.loadout.agent}) ${result.status}.\n\n${capOutput(result.question ?? result.text, artifact)}${replyHint}\n\nSession: ${result.sessionFile ?? "not saved"}\nResult: ${artifact}\nWorker usage: ${result.usage.input} input / ${result.usage.output} output tokens; $${result.usage.cost.toFixed(4)}.`,
       display: true,
-      details: { name: job.name, status: result.status, usage: result.usage, resultFile: artifact },
+      details: { name: job.name, status: result.status, question: result.question, usage: result.usage, resultFile: artifact },
     }, { deliverAs: "followUp", triggerTurn: true });
+  }
+
+  function notifyHealth(job: Job, transition: "stalled" | "recovered"): void {
+    pi.sendMessage({
+      customType: "subagent-health", display: true,
+      content: transition === "stalled"
+        ? `Subagent '${job.name}' has a stale or missing heartbeat. Its process is still present, but monitoring cannot confirm it is responsive. Inspect it with /subagents open ${job.name}, or use subagents_status/subagent_cancel. This is not a timeout on a long-running tool or model request.`
+        : `Subagent '${job.name}' recovered: its heartbeat is fresh again.`,
+      details: { name: job.name, transition },
+    }, { deliverAs: "followUp", triggerTurn: true });
+  }
+
+  function jobLabel(job: Record<string, unknown>): string {
+    return `${job.name} · ${job.status}${job.health === "stalled" ? " · stale heartbeat" : ""} · ${formatDuration(Number(job.elapsedMs ?? 0))}` +
+      `${job.waitingFor ? ` · waiting: ${job.waitingFor}` : ""}` +
+      `${job.activity ? ` · ${job.activity} ${formatDuration(Number(job.activityDurationMs ?? 0))}` : ""}` +
+      `${job.rssMiB ? ` · ${job.rssMiB} MiB` : ""}${job.keepOpen ? " · kept open" : ""}`;
   }
 
   function getManager(ctx: ExtensionContext): Manager {
@@ -52,14 +72,16 @@ export default function (pi: ExtensionAPI): void {
     manager = new Manager({
       directory: join(getAgentDir(), "background-subagents", id),
       parentPane: process.env.TMUX_PANE,
-      extensionPath, maxConcurrent: Number(maxConcurrent), onResult: notifyResult,
+      extensionPath, maxConcurrent: Number(maxConcurrent), onResult: notifyResult, onHealth: notifyHealth,
     });
     sessionId = id;
     timer = setInterval(() => {
       try {
-        manager?.refresh();
-        const live = [...(manager?.jobs.values() ?? [])].filter((job) => ["starting", "active", "waiting"].includes(job.status));
-        ctx.ui.setStatus("subagents", live.length ? `agents ${live.length}/${maxConcurrent} · ${live.map((job) => `${job.name}:${job.status}`).join(" ")}` : undefined);
+        const jobs = manager?.list() ?? [];
+        const live = jobs.filter((job) => job.live);
+        const questions = jobs.filter((job) => job.status === "needs-input");
+        const visible = jobs.filter((job) => job.live || job.status === "needs-input");
+        ctx.ui.setStatus("subagents", visible.length ? `agents ${live.length}/${maxConcurrent}${questions.length ? ` · ${questions.length} need input` : ""} · ${visible.map((job) => `${job.name}:${job.health === "stalled" ? "stalled" : job.status}`).join(" ")}` : undefined);
         lastPollError = undefined;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -131,13 +153,13 @@ export default function (pi: ExtensionAPI): void {
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _update, ctx) {
       const { agents, warnings } = definitions(ctx);
-      const profiles = agents.map(({ name, description, tools, model, thinking, source }) => ({ name, description, tools, model: model ?? "parent model", thinking: thinking ?? "parent thinking", source }));
+      const profiles = agents.map(({ name, description, tools, skills, model, thinking, source }) => ({ name, description, tools, skills, model: model ?? "parent model", thinking: thinking ?? "parent thinking", source }));
       return textResult(JSON.stringify({ agents: profiles, warnings }, null, 2), { agents: profiles, warnings });
     },
   });
   pi.registerTool({
     name: "subagents_status", label: "Subagent status",
-    description: "List delegated tasks and their status, saved sessions, and live Pi process RSS memory on Linux. Does not wait for tasks.",
+    description: "List delegated tasks, clarification questions, waiting reasons, runtime/activity durations, heartbeat health, saved sessions, and live Pi process RSS on Linux. Does not wait for tasks.",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _update, ctx) {
       const jobs = getManager(ctx).list();
@@ -179,12 +201,12 @@ export default function (pi: ExtensionAPI): void {
         if (!action) {
           const jobs = m.list();
           if (!jobs.length) { ctx.ui.notify("No subagents yet. /subagent scout <task>", "info"); return; }
-          const options = jobs.map((job) => `${job.name} · ${job.status}${job.rssMiB ? ` · ${job.rssMiB} MiB` : ""}`);
+          const options = jobs.map(jobLabel);
           const selected = await ctx.ui.select("Open subagent (keeps it alive)", options);
           if (selected) await m.open(String(jobs[options.indexOf(selected)].name));
         } else if (action === "list") {
           const jobs = m.list();
-          ctx.ui.notify(jobs.map((j) => `${j.name} · ${j.status}${j.activity ? ` · ${j.activity}` : ""}${j.rssMiB ? ` · ${j.rssMiB} MiB` : ""}${j.keepOpen ? " · kept open" : ""}`).join("\n") || "No subagents.", "info");
+          ctx.ui.notify(jobs.map((job) => `${jobLabel(job)}${job.question ? `\n  Question: ${job.question}` : ""}`).join("\n") || "No subagents.", "info");
         } else if (!name) throw new Error(`Usage: /subagents ${action} <name>`);
         else if (action === "open") await m.open(name);
         else if (action === "release") { m.release(name); ctx.ui.notify(`${name} will exit when idle.`, "info"); }

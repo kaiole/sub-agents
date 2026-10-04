@@ -5,12 +5,14 @@ import { fileURLToPath } from "node:url";
 import { getAgentDir, parseFrontmatter, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { BUILTIN_TOOLS, type Loadout } from "./shared.ts";
+import { resolvePreloadedSkills } from "./skills.ts";
 
 export interface Agent {
   name: string;
   description: string;
   tools: string[];
   extensions: string[];
+  skills: string[];
   model?: string;
   thinking?: ThinkingLevel;
   cwd?: string;
@@ -61,6 +63,7 @@ export function parseAgent(content: string, file: string): Agent {
     name, description, tools,
     extensions: f.extensions === undefined ? [] : list(f.extensions, "extensions").map((p) =>
       p.startsWith("builtin:") ? p : resolve(dirname(file), p.startsWith("~/") ? join(homedir(), p.slice(2)) : p)),
+    skills: f.skills === undefined ? [] : list(f.skills, "skills"),
     model: optionalString(f.model, "model"),
     thinking: thinking as ThinkingLevel | undefined,
     cwd: optionalString(f.cwd, "cwd"),
@@ -108,8 +111,9 @@ export function resolveLoadout(agent: Agent, pi: ExtensionAPI, ctx: ExtensionCon
   const extensions = new Set(agent.extensions);
   const known = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
   for (const name of agent.tools) {
-    if (name.startsWith("subagent") || name === "ask_question") throw new Error("Nested subagents are not supported");
-    if (BUILTIN_TOOLS.has(name)) continue;
+    if (name.startsWith("subagent")) throw new Error("Nested subagents are not supported");
+    // ask_question is provided by the worker controller, not a parent extension.
+    if (BUILTIN_TOOLS.has(name) || name === "ask_question") continue;
     const source = known.get(name)?.sourceInfo.path;
     if (!source) {
       if (agent.extensions.length) continue; // Explicit extensions are validated by the child after loading.
@@ -121,11 +125,13 @@ export function resolveLoadout(agent: Agent, pi: ExtensionAPI, ctx: ExtensionCon
   const rawCwd = cwdOverride ?? agent.cwd ?? ctx.cwd;
   const cwd = resolve(ctx.cwd, rawCwd.startsWith("~/") ? join(homedir(), rawCwd.slice(2)) : rawCwd);
   if (!statSync(cwd).isDirectory()) throw new Error(`Not a directory: ${cwd}`);
+  const skills = resolvePreloadedSkills(agent.skills, pi, ctx);
   return {
     agent: agent.name,
     tools: [...agent.tools],
     extensions: [...extensions],
     systemPrompt: agent.systemPrompt,
+    ...(skills.length ? { skills } : {}),
     model: modelOverride ?? agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
     thinking: agent.thinking ?? ctx.thinkingLevel ?? pi.getThinkingLevel(),
     cwd,
