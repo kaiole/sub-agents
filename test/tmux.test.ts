@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -182,11 +182,53 @@ test("real Pi workers use background windows, complete, resume, inspect, steer, 
   assert.equal(manager.get(cancelledQuestion.name).status, "cancelled");
   assert.equal(results.length, 10, "cancel/open/release/reload must not replay the historical question");
 
+  // Real editing workers write only in their worktree, resume there, then integrate explicitly.
+  const repository = join(directory, "repo");
+  mkdirSync(repository);
+  const git = (...args: string[]) => execFileSync("git", ["-C", repository, ...args], { encoding: "utf8" });
+  git("init", "-q");
+  writeFileSync(join(repository, "parent.txt"), "committed\n");
+  writeFileSync(join(repository, ".gitignore"), "ignored.txt\n");
+  git("add", ".");
+  git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "initial");
+  writeFileSync(join(repository, "parent.txt"), "unfinished parent\n");
+  git("add", "parent.txt");
+  writeFileSync(join(repository, "parent.txt"), "unfinished parent plus unstaged\n");
+  writeFileSync(join(repository, "seed.txt"), "untracked input\n");
+  writeFileSync(join(repository, "ignored.txt"), "not copied\n");
+  const indexBefore = readFileSync(join(repository, ".git", "index"));
+  const isolated = manager.spawn({ ...loadout, cwd: repository, tools: ["read", "write"] }, "WORKTREE_EDIT feature.txt", "isolated", false, { baseline: "current" });
+  await completed(isolated, 11);
+  assert.equal(isolated.status, "done", diagnose(isolated));
+  assert.ok(isolated.worktree);
+  assert.equal(readFileSync(join(isolated.loadout.cwd, "parent.txt"), "utf8"), "unfinished parent plus unstaged\n");
+  assert.equal(readFileSync(join(isolated.loadout.cwd, "seed.txt"), "utf8"), "untracked input\n");
+  assert.equal(existsSync(join(isolated.loadout.cwd, "ignored.txt")), false);
+  assert.equal(existsSync(join(repository, "feature.txt")), false, "completion must not integrate automatically");
+  const isolatedCwd = isolated.loadout.cwd;
+  manager = new Manager(options);
+  manager.message(isolated.name, "WORKTREE_EDIT followup.txt");
+  const resumedIsolated = manager.get(isolated.name);
+  await completed(resumedIsolated, 12);
+  assert.equal(resumedIsolated.loadout.cwd, isolatedCwd);
+  const review = manager.diff(isolated.name);
+  assert.match(review.patch, /feature\.txt/);
+  assert.match(review.patch, /followup\.txt/);
+  assert.ok(!review.patch.includes("unfinished parent"));
+  writeFileSync(join(repository, "later.txt"), "parent kept working\n");
+  assert.equal(manager.integrate(isolated.name).state, "integrated");
+  assert.equal(readFileSync(join(repository, "feature.txt"), "utf8"), "worker edit\n");
+  assert.equal(readFileSync(join(repository, "followup.txt"), "utf8"), "worker edit\n");
+  assert.equal(readFileSync(join(repository, "later.txt"), "utf8"), "parent kept working\n");
+  assert.deepEqual(readFileSync(join(repository, ".git", "index")), indexBefore);
+  assert.equal(existsSync(isolatedCwd), false);
+  assert.throws(() => manager.message(isolated.name, "do more"), /integrated/);
+
   // Exercise the parent factory/tool wiring too, with a real worker and captured Pi API calls.
   process.env.TMUX = `${tmux.command(["display-message", "-p", "-t", parentPane, "#{socket_path}"])},0,0`;
   process.env.TMUX_PANE = parentPane;
   mkdirSync(join(process.env.PI_CODING_AGENT_DIR!, "agents"), { recursive: true });
-  writeFileSync(join(process.env.PI_CODING_AGENT_DIR!, "agents", "worker.md"), `---\nname: worker\ndescription: Parent wiring test\ntools: [read]\nmodel: subagent-test/mock\nextensions: [${JSON.stringify(provider)}]\n---\nTest worker.`);
+  writeFileSync(join(process.env.PI_CODING_AGENT_DIR!, "agents", "worker.md"), `---\nname: worker\ndescription: Parent wiring test\ntools: [read, write]\nmodel: subagent-test/mock\nextensions: [${JSON.stringify(provider)}]\n---\nTest worker.`);
   const handlers = new Map<string, (...args: any[]) => any>();
   const tools = new Map<string, ToolDefinition>();
   const commands = new Map<string, any>();
@@ -200,12 +242,12 @@ test("real Pi workers use background windows, complete, resume, inspect, steer, 
     sendMessage: (message: any, options: any) => parentMessages.push({ message, options }),
   } as unknown as ExtensionAPI;
   const ctx = {
-    cwd: directory, model: { provider: "subagent-test", id: "mock" }, thinkingLevel: "off",
+    cwd: repository, model: { provider: "subagent-test", id: "mock" }, thinkingLevel: "off",
     isProjectTrusted: () => false, sessionManager: { getSessionId: () => "parent-wiring" },
     ui: { setStatus: () => {}, notify: () => {} },
   } as unknown as ExtensionContext;
   extension(api);
-  assert.deepEqual([...tools.keys()], ["subagent", "subagent_message", "subagents_list", "subagents_status", "subagent_cancel"]);
+  assert.deepEqual([...tools.keys()], ["subagent", "subagent_message", "subagents_list", "subagents_status", "subagent_cancel", "subagent_diff", "subagent_integrate", "subagent_discard"]);
   assert.ok(commands.has("subagents"));
   assert.equal(handlers.has("session_start"), true);
   handlers.get("session_start")!({}, ctx);
@@ -240,5 +282,22 @@ test("real Pi workers use background windows, complete, resume, inspect, steer, 
   handlers.get("session_start")!({}, ctx);
   await new Promise((resolve) => setTimeout(resolve, 1100));
   assert.equal(parentMessages.length, 5, "parent reload must not redeliver completion, questions, or health transitions");
+  // Model-facing review/integrate/discard operations use the same durable lifecycle.
+  const apiCall = (tool: string, params: any) => tools.get(tool)!.execute(`call-${tool}`, params, new AbortController().signal, undefined, ctx as any);
+  await apiCall("subagent", { agent: "worker", task: "WORKTREE_EDIT api-feature.txt", name: "api-isolated", baseline: "current" });
+  await waitFor(() => parentMessages.length === 6, () => JSON.stringify(parentMessages));
+  await waitFor(() => {
+    const saved = readJson<{ jobs: Job[] }>(join(process.env.PI_CODING_AGENT_DIR!, "background-subagents", "parent-wiring", "registry.json"))!.jobs.find((job) => job.name === "api-isolated")!;
+    return !tmux.panes().some((pane) => pane.paneId === saved.paneId);
+  }, () => "api worker did not exit");
+  assert.equal(existsSync(join(repository, "api-feature.txt")), false);
+  const diff = await apiCall("subagent_diff", { name: "api-isolated" });
+  assert.match((diff.content[0] as any).text, /api-feature\.txt/);
+  const integrated = await apiCall("subagent_integrate", { name: "api-isolated" });
+  assert.equal((integrated.details as any).state, "integrated");
+  assert.equal(readFileSync(join(repository, "api-feature.txt"), "utf8"), "worker edit\n");
+  await apiCall("subagent_cancel", { name: "parent-worker" });
+  const discarded = await apiCall("subagent_discard", { name: "parent-worker" });
+  assert.equal((discarded.details as any).state, "discarded");
   handlers.get("session_shutdown")!({}, ctx);
 });

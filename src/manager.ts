@@ -1,10 +1,22 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { CHILD_ENV, readJson, runFile, uniqueName, writeJson, type Completion, type Control, type Job, type Launch, type Loadout } from "./shared.ts";
+import { CHILD_ENV, readJson, runFile, uniqueName, writeJson, type Completion, type Control, type Job, type Launch, type Loadout, type SpawnOptions } from "./shared.ts";
 import { piInvocation, quote, Tmux, type Pane } from "./tmux.ts";
 import { heartbeatHealth, readActivity } from "./health.ts";
 import { renderPreloadedSkills } from "./skills.ts";
+import { createWorktree, diffWorktree, integrateWorktree, removeWorktree } from "./worktrees.ts";
+
+// Unknown/custom tools are conservatively treated as editing-capable. This is a
+// workflow default, not a permission boundary; callers can explicitly choose shared.
+const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls", "ask_question", "web_search", "web_fetch", "pdf_inspect", "pdf_search", "pdf_read", "pdf_render"]);
+
+export interface WorktreeResult {
+  state: "integrated" | "discarded";
+  parentRoot: string;
+  path: string;
+  cleanupError?: string;
+}
 
 interface Registry { version: 1; jobs: Job[] }
 export interface ManagerOptions {
@@ -76,7 +88,14 @@ export class Manager {
     if (live >= this.options.maxConcurrent) throw new Error(`Subagent limit reached (${live}/${this.options.maxConcurrent}). Release or cancel a worker before spawning another.`);
   }
 
+  private assertRetained(job: Job): void {
+    if (job.worktree && job.worktree.state !== "retained") {
+      throw new Error(`'${job.name}' was ${job.worktree.state}; its checkout is closed. Start a new task for further work. Saved session: ${job.result?.sessionFile ?? "not saved"}`);
+    }
+  }
+
   private startRun(job: Job, keepOpen: boolean, inspection = false): void {
+    this.assertRetained(job);
     const run = join(job.directory, "runs", randomUUID());
     mkdirSync(run, { recursive: true, mode: 0o700 });
     const launch: Launch = {
@@ -90,7 +109,10 @@ export class Manager {
       writeJson(join(run, "question.json"), { question: job.result.question });
     }
     const promptFile = join(job.directory, "system-prompt.md");
-    writeFileSync(promptFile, `${job.loadout.systemPrompt}\n\n${renderPreloadedSkills(job.loadout.skills)}\n\nYou are the ${job.name} subagent. Complete the delegated task and end with a concise, useful result. Your final response will be returned to the parent. If missing requirements or a material decision block your work, call ask_question alone and stop instead of guessing. The parent will answer by resuming your saved conversation. You share the working tree with the parent; avoid unrelated edits.\n`, { mode: 0o600 });
+    const isolation = job.worktree
+      ? `You have an isolated Git worktree at ${job.worktree.path}, on task branch ${job.worktree.branch}, starting from a fixed '${job.worktree.baseline}' baseline. Work only in this checkout and on this task branch; do not edit the parent checkout (${job.worktree.parentRoot}) or other branches. Do not use the shared Git stash, change repository-wide Git configuration, or push task branches/private snapshot refs. Leave your changes here; the parent will explicitly review and integrate only your delta against the baseline. Ignored dependencies and build outputs are not copied. This is file isolation, not a sandbox: external services, ports, databases and caches may be shared. Report shared-resource needs to the parent before using them. Avoid unrelated edits.`
+      : "You share the working tree with the parent; avoid unrelated edits and coordinate concurrent writes.";
+    writeFileSync(promptFile, `${job.loadout.systemPrompt}\n\n${renderPreloadedSkills(job.loadout.skills)}\n\nYou are the ${job.name} subagent. Complete the delegated task and end with a concise, useful result. Your final response will be returned to the parent. If missing requirements or a material decision block your work, call ask_question alone and stop instead of guessing. The parent will answer by resuming your saved conversation. ${isolation}\n`, { mode: 0o600 });
     const args = [
       "--session-id", job.sessionId, "--session-dir", join(job.directory, "sessions"),
       "--name", `subagent:${job.name}`, "--no-extensions", "--no-prompt-templates",
@@ -136,16 +158,28 @@ export class Manager {
     }
   }
 
-  spawn(loadout: Loadout, task: string, name = loadout.agent, keepOpen = false): Job {
+  spawn(loadout: Loadout, task: string, name = loadout.agent, keepOpen = false, options: SpawnOptions = {}): Job {
     if (!task.trim()) throw new Error("A nonempty task is required.");
+    if (options.isolation !== undefined && !["worktree", "shared"].includes(options.isolation)) throw new Error("isolation must be worktree or shared.");
+    if (options.baseline !== undefined && !["head", "current"].includes(options.baseline)) throw new Error("baseline must be head or current.");
+    if (options.isolation === "shared" && options.baseline !== undefined) throw new Error("baseline applies only to worktree isolation.");
     this.refresh();
     this.capacity(this.tmux.panes());
     const id = randomUUID();
     const job: Job = {
       id, sessionId: randomUUID(), name: uniqueName(name, this.jobs.keys()),
-      directory: join(this.options.directory, id), loadout, run: "", task,
+      directory: join(this.options.directory, id), loadout: structuredClone(loadout), run: "", task,
       startedAt: this.now(), status: "starting",
     };
+    const isolated = options.isolation === "worktree" || (options.isolation !== "shared" &&
+      (options.baseline !== undefined || loadout.tools.some((tool) => !READ_ONLY_TOOLS.has(tool))));
+    if (isolated) {
+      job.worktree = createWorktree(loadout.cwd, job.directory, id, options.baseline ?? "head");
+      job.loadout.cwd = job.worktree.cwd;
+      // A new checkout can contain different project resources, especially at HEAD.
+      // Do not extend the parent's project approval to this new directory.
+      job.loadout.approveProject = false;
+    }
     this.jobs.set(job.name, job);
     mkdirSync(this.mailbox(job), { recursive: true, mode: 0o700 });
     this.enqueue(job, task);
@@ -163,6 +197,7 @@ export class Manager {
     if (!message.trim()) throw new Error("A nonempty message is required.");
     this.refresh();
     const job = this.get(name);
+    this.assertRetained(job);
     const panes = this.tmux.panes();
     const pane = this.pane(job, panes);
     if (!pane || pane.dead) {
@@ -176,6 +211,7 @@ export class Manager {
   async open(name: string): Promise<Job> {
     this.refresh();
     const job = this.get(name);
+    this.assertRetained(job);
     const deadline = Date.now() + 15000;
     let openedFresh = false;
     while (Date.now() < deadline) {
@@ -204,6 +240,7 @@ export class Manager {
 
   release(name: string): void {
     const job = this.get(name);
+    this.assertRetained(job);
     writeJson(runFile(job, "control.json"), { keepOpen: false } satisfies Control);
   }
 
@@ -233,6 +270,68 @@ export class Manager {
     this.refresh();
   }
 
+  private isolatedJob(name: string): Job & { worktree: NonNullable<Job["worktree"]> } {
+    this.refresh();
+    const job = this.get(name);
+    if (!job.worktree) throw new Error(`'${name}' uses a shared checkout; there is no isolated result to integrate or discard.`);
+    return job as Job & { worktree: NonNullable<Job["worktree"]> };
+  }
+
+  private assertStopped(job: Job): void {
+    const pane = this.pane(job, this.tmux.panes());
+    if (pane && !pane.dead) throw new Error(`'${job.name}' is still open. Release it and wait for exit, or cancel it before reviewing/integrating/discarding its checkout.`);
+    if (this.hasMail(job)) throw new Error(`'${job.name}' has queued messages. Cancel it before finalizing its checkout.`);
+  }
+
+  diff(name: string): { patch: string; file: string } {
+    const job = this.isolatedJob(name);
+    this.assertRetained(job);
+    this.assertStopped(job);
+    const patch = diffWorktree(job.worktree);
+    const file = join(job.directory, "worker.patch");
+    writeFileSync(file, patch, { mode: 0o600 });
+    return { patch, file };
+  }
+
+  private cleanup(job: Job & { worktree: NonNullable<Job["worktree"]> }): WorktreeResult {
+    try {
+      removeWorktree(job.worktree);
+      job.worktreeCleanupError = undefined;
+    } catch (error) {
+      job.worktreeCleanupError = error instanceof Error ? error.message : String(error);
+    }
+    this.save();
+    return { state: job.worktree.state as WorktreeResult["state"], parentRoot: job.worktree.parentRoot,
+      path: job.worktree.path, cleanupError: job.worktreeCleanupError };
+  }
+
+  integrate(name: string): WorktreeResult {
+    const job = this.isolatedJob(name);
+    this.assertStopped(job);
+    if (job.worktree.state === "discarded") throw new Error(`'${name}' was discarded.`);
+    if (job.worktree.state === "retained") {
+      // Keep the review artifact even after the checkout has been removed.
+      this.diff(name);
+      integrateWorktree(job.worktree);
+      job.worktree.state = "integrated";
+      job.worktreeFinalizedAt = this.now();
+      // Persist closure before destructive cleanup; retrying never reapplies changes.
+      this.save();
+    }
+    return this.cleanup(job);
+  }
+
+  discard(name: string): WorktreeResult {
+    const job = this.isolatedJob(name);
+    this.assertStopped(job);
+    if (job.worktree.state === "retained") {
+      job.worktree.state = "discarded";
+      job.worktreeFinalizedAt = this.now();
+      this.save();
+    }
+    return this.cleanup(job);
+  }
+
   refresh(): void {
     if (!this.jobs.size) return;
     const panes = this.tmux.panes();
@@ -240,6 +339,7 @@ export class Manager {
     let changed = false;
     const restart: Job[] = [];
     for (const job of this.jobs.values()) {
+      if (job.worktree && job.worktree.state !== "retained") continue;
       const pane = this.pane(job, panes);
       let result = readJson<Completion>(runFile(job, "result.json"));
       const outbox = runFile(job, "results");
@@ -318,7 +418,8 @@ export class Manager {
     return [...this.jobs.values()].map((job) => {
       const activity = readActivity(runFile(job, "activity.json"));
       const pane = this.pane(job, panes);
-      const live = !!pane && !pane.dead && !readJson(runFile(job, "exit.json"));
+      const finalized = job.worktree && job.worktree.state !== "retained";
+      const live = !finalized && !!pane && !pane.dead && !readJson(runFile(job, "exit.json"));
       let rssMiB: number | undefined;
       if (live && activity?.pid) {
         try {
@@ -327,19 +428,23 @@ export class Manager {
         } catch { /* Memory statistics are optional and Linux-specific. */ }
       }
       return {
-        name: job.name, agent: job.loadout.agent, status: job.status, live,
+        name: job.name, agent: job.loadout.agent, status: finalized ? job.worktree!.state : job.status, live,
         activity: live ? activity?.detail : undefined,
         elapsedMs: Math.max(0, (job.finishedAt ?? now) - job.startedAt),
         activityDurationMs: live && activity ? Math.max(0, now - (activity.since ?? activity.updatedAt)) : undefined,
         health: live ? job.health : undefined,
         heartbeatAgeMs: live ? Math.max(0, now - (job.lastHeartbeatAt ?? job.startedAt)) : undefined,
-        waitingFor: job.status === "needs-input" ? "clarification" : live ? activity?.waitingFor : undefined,
-        question: job.status === "needs-input" ? job.result?.question ?? job.result?.text : undefined,
+        waitingFor: !finalized && job.status === "needs-input" ? "clarification" : live ? activity?.waitingFor : undefined,
+        question: !finalized && job.status === "needs-input" ? job.result?.question ?? job.result?.text : undefined,
         keepOpen: live ? readJson<Control>(runFile(job, "control.json"))?.keepOpen : false,
         pid: live ? activity?.pid : undefined, rssMiB,
         pane: live ? job.paneId : undefined, cwd: job.loadout.cwd,
         sessionFile: activity?.sessionFile ?? job.result?.sessionFile,
         resultFile: job.resultFile,
+        isolation: job.worktree ? "worktree" : "shared",
+        worktree: job.worktree,
+        worktreeFinalizedAt: job.worktreeFinalizedAt,
+        worktreeCleanupError: job.worktreeCleanupError,
       };
     });
   }

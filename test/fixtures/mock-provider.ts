@@ -36,6 +36,18 @@ export default function (pi: ExtensionAPI) {
             stream.push({ type: "done", reason: "toolUse", message: output });
             return;
           }
+          const edit = users.at(-1)?.match(/^WORKTREE_EDIT\s+(\S+)$/);
+          if (edit && context.messages.at(-1)?.role !== "toolResult") {
+            if (!getCurrentTools(context.messages).some((tool) => tool.name === "write")) throw new Error("write was not exposed.");
+            if (!getCurrentSystemPrompt(context.messages).includes("isolated Git worktree")) throw new Error("Worktree instructions were not present.");
+            const toolCall = { type: "toolCall" as const, id: "worktree-write", name: "write", arguments: { path: edit[1], content: "worker edit\n" } };
+            output.content = [toolCall];
+            stream.push({ type: "toolcall_start", contentIndex: 0, partial: output });
+            stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: output });
+            output.stopReason = "toolUse";
+            stream.push({ type: "done", reason: "toolUse", message: output });
+            return;
+          }
           if (users.at(-1)?.includes("SKILL_CHECK") && !getCurrentSystemPrompt(context.messages).includes("PRELOADED_SKILL_INSTRUCTIONS")) {
             throw new Error("Skill instructions were not present in the initial system prompt.");
           }

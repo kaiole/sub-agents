@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { Baseline, Worktree } from "./worktrees.ts";
 
 export const CHILD_ENV = "PI_BACKGROUND_SUBAGENT_RUN";
 export const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"]);
@@ -23,6 +24,11 @@ export interface Loadout {
   approveProject: boolean;
 }
 
+export interface SpawnOptions {
+  isolation?: "worktree" | "shared";
+  baseline?: Baseline;
+}
+
 export interface Job {
   name: string;
   id: string;
@@ -41,6 +47,9 @@ export interface Job {
   deliveredResults?: string[];
   result?: Completion;
   resultFile?: string;
+  worktree?: Worktree;
+  worktreeFinalizedAt?: number;
+  worktreeCleanupError?: string;
 }
 
 export interface Launch {
