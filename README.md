@@ -53,13 +53,21 @@ Workers survive parent quit, reload, and session switches. Their results are del
 | Tool | Purpose |
 | --- | --- |
 | `subagent({ agent, task, name?, cwd?, model?, keepOpen?, isolation?, baseline? })` | Start asynchronously; duplicate names receive numeric suffixes |
-| `subagent_message({ name, message })` | Steer or resume the same task/session/loadout |
+| `subagent_message({ name, message, deliverAs? })` | Steer, queue a follow-up, or resume the same task/session/loadout |
 | `subagents_list({})` | List profiles and configuration warnings |
 | `subagents_status({})` | Task status, questions/waiting reasons, run/activity durations, heartbeat health, session/result paths, PID and Linux RSS |
 | `subagent_cancel({ name })` | Cancel execution; retain isolated work |
 | `subagent_diff({ name })` | Review the stopped worker's delta against its fixed baseline |
 | `subagent_integrate({ name })` | Explicitly integrate, preserving parent edits and staging; finalize and clean up |
 | `subagent_discard({ name })` | Explicitly delete retained isolated work; finalize and clean up |
+
+`subagent_message` accepts `deliverAs: "steer"` (default) or `"followUp"`. Steering influences ongoing work before the next model call; follow-ups wait until the worker finishes its current work, then continue the same conversation. Either mode starts a turn if the worker is idle or resumes its saved session if exited. For example:
+
+```js
+subagent_message({ name: "worker", message: "After implementing, review the tests too.", deliverAs: "followUp" })
+```
+
+These are native Pi queues, not separately reported assignments: automatic completion waits for queued work to finish and reports the last answer. Earlier answers remain in the saved conversation. `/subagents message <name> <text>` continues to use steering.
 
 Results are queued as parent follow-ups, rather than interrupting its current turn. Long results are truncated in model context and linked to the full artifact. Worker token/cost usage is included in completion messages; it is separate from the parent's `/session` totals.
 
@@ -216,7 +224,7 @@ Artifacts live under:
 
 The agent-directory override `PI_CODING_AGENT_DIR` is respected. Artifacts are private to the user; transcripts may still contain sensitive data. There is no automatic transcript retention policy. Delete old parent directories manually **after all their workers have exited**.
 
-The window runs its launch script directly, avoiding interactive-shell startup races. Messages travel through a durable file mailbox into `pi.sendUserMessage`, not through simulated terminal keystrokes. Completion uses `agent_settled`, so retries/compaction/queued steering finish before results are reported. A message racing with auto-exit resumes the saved session once the previous worker has exited. Window ownership tags prevent accidental access to reused tmux pane IDs.
+The window runs its launch script directly, avoiding interactive-shell startup races. Messages travel through a durable file mailbox into `pi.sendUserMessage`, not through simulated terminal keystrokes. Completion uses `agent_settled`, so retries/compaction/queued steering and follow-ups finish before results are reported. A message racing with auto-exit resumes the saved session once the previous worker has exited. Window ownership tags prevent accidental access to reused tmux pane IDs.
 
 ## Development
 

@@ -83,9 +83,11 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
       const file = join(launch!.mailbox, name);
       const mail = readJson<Mail>(file);
       if (!mail || typeof mail.message !== "string" || !mail.message.trim()) throw new Error(`Invalid mailbox message: ${file}`);
-      // sendUserMessage always triggers a turn when idle and queues steering while busy.
+      const deliverAs = mail.deliverAs === undefined ? "steer" : mail.deliverAs;
+      if (deliverAs !== "steer" && deliverAs !== "followUp") throw new Error(`Invalid mailbox delivery mode: ${file}`);
+      // Both modes trigger a turn when idle; while busy, Pi controls delivery timing.
       clearQuestion();
-      pi.sendUserMessage(mail.message, { deliverAs: "steer", expandPromptTemplates: false });
+      pi.sendUserMessage(mail.message, { deliverAs, expandPromptTemplates: false });
       unlinkSync(file);
       idle = false;
     }

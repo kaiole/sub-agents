@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { CHILD_ENV, readJson, runFile, uniqueName, writeJson, type Completion, type Control, type Job, type Launch, type Loadout, type SpawnOptions } from "./shared.ts";
+import { CHILD_ENV, readJson, runFile, uniqueName, writeJson, type Completion, type Control, type Job, type Launch, type Loadout, type Mail, type MessageDelivery, type SpawnOptions } from "./shared.ts";
 import { piInvocation, quote, Tmux, type Pane } from "./tmux.ts";
 import { heartbeatHealth, readActivity } from "./health.ts";
 import { renderPreloadedSkills } from "./skills.ts";
@@ -73,11 +73,11 @@ export class Manager {
     writeJson(file, failure);
     this.deliver(job, failure, file);
   }
-  private enqueue(job: Job, message: string): void {
+  private enqueue(job: Job, message: string, deliverAs: MessageDelivery = "steer"): void {
     if (!message.trim()) throw new Error("A nonempty task/message is required.");
     // A sortable prefix preserves order even for several messages in the same millisecond.
     const name = `${Date.now()}-${String(this.mailSequence++).padStart(6, "0")}-${randomUUID()}.json`;
-    writeJson(join(this.mailbox(job), name), { message });
+    writeJson(join(this.mailbox(job), name), { message, deliverAs } satisfies Mail);
   }
   private pane(job: Job, panes: Pane[]): Pane | undefined {
     // Ownership tag prevents killing or attaching to a reused pane after a tmux server restart.
@@ -194,8 +194,9 @@ export class Manager {
     return job;
   }
 
-  message(name: string, message: string): Job {
+  message(name: string, message: string, deliverAs: MessageDelivery = "steer"): Job {
     if (!message.trim()) throw new Error("A nonempty message is required.");
+    if (deliverAs !== "steer" && deliverAs !== "followUp") throw new Error("deliverAs must be 'steer' or 'followUp'.");
     this.refresh();
     const job = this.get(name);
     this.assertRetained(job);
@@ -203,9 +204,9 @@ export class Manager {
     const pane = this.pane(job, panes);
     if (!pane || pane.dead) {
       this.capacity(panes);
-      this.enqueue(job, message);
+      this.enqueue(job, message, deliverAs);
       this.startRun(job, false);
-    } else this.enqueue(job, message);
+    } else this.enqueue(job, message, deliverAs);
     return job;
   }
 
@@ -389,7 +390,7 @@ export class Manager {
         if (!inspectionExit && job.status === "error" && (!result || result.status !== "error") && before !== "error") {
           this.reportFailure(job, `Worker exited unexpectedly${exit ? ` (exit ${exit.exitCode})` : " (tmux pane disappeared)"}. Launch artifacts: ${job.run}`, activity?.sessionFile);
         }
-        // A steering message can arrive just as an auto-exiting worker shuts down.
+        // A message can arrive just as an auto-exiting worker shuts down.
         // Durable mail survives that race and resumes the same session, never a second writer.
         if (["done", "needs-input"].includes(job.status) && this.hasMail(job)) restart.push(job);
       }

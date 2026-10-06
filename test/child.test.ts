@@ -225,6 +225,48 @@ test("a parent mailbox reply clears clarification before the next turn, includin
   assert.equal(h.worker.shutdowns, 1);
 });
 
+test("mailbox delivery preserves native steering/follow-up modes and legacy defaults", (t) => {
+  const h = setup(t);
+  h.worker.start();
+  const messages = [
+    { message: "Legacy" },
+    { message: "Steer", deliverAs: "steer" },
+    { message: "Follow up", deliverAs: "followUp" },
+  ];
+  messages.forEach((mail, index) => writeJson(join(h.mailbox, `${index}.json`), mail));
+  h.tick();
+  assert.deepEqual(h.pi.sent, [
+    { message: "Legacy", options: { deliverAs: "steer", expandPromptTemplates: false } },
+    { message: "Steer", options: { deliverAs: "steer", expandPromptTemplates: false } },
+    { message: "Follow up", options: { deliverAs: "followUp", expandPromptTemplates: false } },
+  ]);
+  assert.deepEqual(readdirSync(h.mailbox), []);
+  assert.equal(h.worker.shutdowns, 0);
+});
+
+test("follow-up mail racing settlement starts another turn instead of auto-exiting", (t) => {
+  const h = setup(t);
+  h.worker.start();
+  h.emit("message_end", assistant("First answer."));
+  h.worker.settle();
+  writeJson(join(h.mailbox, "000001.json"), { message: "Next", deliverAs: "followUp" });
+  h.tick();
+  assert.equal(h.worker.shutdowns, 0);
+  assert.deepEqual(h.pi.sent, [{ message: "Next", options: { deliverAs: "followUp", expandPromptTemplates: false } }]);
+});
+
+test("invalid mailbox delivery modes fail without submitting or deleting the message", (t) => {
+  const h = setup(t);
+  writeJson(join(h.mailbox, "000001.json"), { message: "Invalid", deliverAs: "bad" });
+  h.tick();
+  assert.deepEqual(h.pi.sent, []);
+  assert.equal(h.result().status, "error");
+  assert.match(h.result().text, /Invalid mailbox delivery mode/);
+  assert.equal(readdirSync(h.mailbox).length, 1);
+  assert.equal(h.worker.aborts, 1);
+  assert.equal(h.worker.shutdowns, 1);
+});
+
 test("interactive input clears a pending question and a subsequent turn completes normally", async (t) => {
   const h = setup(t, { keepOpen: true });
   h.worker.start();

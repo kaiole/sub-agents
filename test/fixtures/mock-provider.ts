@@ -36,6 +36,16 @@ export default function (pi: ExtensionAPI) {
             stream.push({ type: "done", reason: "toolUse", message: output });
             return;
           }
+          // A tool-using task distinguishes steering (before continuation) from follow-ups (after it).
+          if (users.at(-1) === "SLOW TOOL_SEQUENCE" && context.messages.at(-1)?.role !== "toolResult") {
+            const toolCall = { type: "toolCall" as const, id: "sequence-read", name: "read", arguments: { path: "sequence.txt" } };
+            output.content = [toolCall];
+            stream.push({ type: "toolcall_start", contentIndex: 0, partial: output });
+            stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: output });
+            output.stopReason = "toolUse";
+            stream.push({ type: "done", reason: "toolUse", message: output });
+            return;
+          }
           const edit = users.at(-1)?.match(/^WORKTREE_EDIT\s+(\S+)$/);
           if (edit && context.messages.at(-1)?.role !== "toolResult") {
             if (!getCurrentTools(context.messages).some((tool) => tool.name === "write")) throw new Error("write was not exposed.");
@@ -51,10 +61,11 @@ export default function (pi: ExtensionAPI) {
           if (users.at(-1)?.includes("SKILL_CHECK") && !getCurrentSystemPrompt(context.messages).includes("PRELOADED_SKILL_INSTRUCTIONS")) {
             throw new Error("Skill instructions were not present in the initial system prompt.");
           }
+          const answer = users.at(-1) === "SLOW TOOL_SEQUENCE" ? "Original task complete." : text;
           stream.push({ type: "text_start", contentIndex: 0, partial: output });
-          output.content[0] = { type: "text", text };
-          stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
-          stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
+          output.content[0] = { type: "text", text: answer };
+          stream.push({ type: "text_delta", contentIndex: 0, delta: answer, partial: output });
+          stream.push({ type: "text_end", contentIndex: 0, content: answer, partial: output });
           output.stopReason = "stop";
           stream.push({ type: "done", reason: "stop", message: output });
         } catch (error) {

@@ -82,7 +82,7 @@ test("real Pi workers use background windows, complete, resume, inspect, steer, 
   const sessionId = first.sessionId;
   const oldResult = first.resultFile;
 
-  manager.message(first.name, "follow-up\nwith newlines");
+  manager.message(first.name, "follow-up\nwith newlines", "followUp");
   await completed(first, 2);
   assert.equal(first.sessionId, sessionId);
   assert.match(results[1].text, /first task \| follow-up\nwith newlines/);
@@ -228,6 +228,28 @@ test("real Pi workers use background windows, complete, resume, inspect, steer, 
   assert.equal(existsSync(isolatedCwd), false);
   assert.throws(() => manager.message(isolated.name, "do more"), /integrated/);
 
+  // Native follow-ups must finish the tool-using task before delivery, with only one completion.
+  writeFileSync(join(directory, "sequence.txt"), "Tool sequence input.\n");
+  for (const deliverAs of ["steer", "followUp"] as const) {
+    const before: number = results.length;
+    const sequenced = manager.spawn(loadout, "SLOW TOOL_SEQUENCE", `sequence-${deliverAs}`);
+    await waitFor(() => readJson<Activity>(join(sequenced.run, "activity.json"))?.status === "active", () => diagnose(sequenced));
+    manager.message(sequenced.name, "Next instruction", deliverAs);
+    await completed(sequenced, before + 1);
+    assert.equal(results.length, before + 1, "queued work should produce one settled completion");
+    assert.equal(results.at(-1)?.text, "Echo: SLOW TOOL_SEQUENCE | Next instruction");
+    assert.equal(results.at(-1)?.usage.input, deliverAs === "followUp" ? 30 : 20);
+    const messages = readFileSync(results.at(-1)!.sessionFile!, "utf8").trim().split("\n")
+      .map((line) => JSON.parse(line)).filter((entry) => entry.type === "message").map((entry) => entry.message);
+    const originalAnswer = messages.findIndex((message) => message.role === "assistant" &&
+      message.content.some((part: any) => part.type === "text" && part.text === "Original task complete."));
+    const nextInput = messages.findIndex((message) => message.role === "user" &&
+      message.content.some((part: any) => part.type === "text" && part.text === "Next instruction"));
+    assert.ok(nextInput >= 0, "queued instruction must reach the session");
+    if (deliverAs === "followUp") assert.ok(originalAnswer >= 0 && originalAnswer < nextInput, "original answer must precede the follow-up");
+    else assert.equal(originalAnswer, -1, "steering must arrive before the original task's continuation");
+  }
+
   // Exercise the parent factory/tool wiring too, with a real worker and captured Pi API calls.
   process.env.TMUX = `${tmux.command(["display-message", "-p", "-t", parentPane, "#{socket_path}"])},0,0`;
   process.env.TMUX_PANE = parentPane;
@@ -279,7 +301,8 @@ test("real Pi workers use background windows, complete, resume, inspect, steer, 
   assert.match(parentMessages[3].message.content, /not task completion/);
   assert.match(parentMessages[3].message.content, /subagent_message\(\{ name: "parent-question"/);
   assert.deepEqual(parentMessages[3].options, { deliverAs: "followUp", triggerTurn: true });
-  await tools.get("subagent_message")!.execute("answer-call", { name: "parent-question", message: "Use SQLite." }, new AbortController().signal, undefined, ctx as any);
+  const reply = await tools.get("subagent_message")!.execute("answer-call", { name: "parent-question", message: "Use SQLite.", deliverAs: "followUp" }, new AbortController().signal, undefined, ctx as any);
+  assert.equal((reply.details as any).deliverAs, "followUp");
   await waitFor(() => parentMessages.length === 5, () => JSON.stringify(parentMessages));
   assert.equal(parentMessages[4].message.details.status, "done");
   handlers.get("session_shutdown")!({}, ctx);

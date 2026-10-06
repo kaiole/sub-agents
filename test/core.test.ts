@@ -6,7 +6,7 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { parseAgent, resolveLoadout } from "../src/agents.ts";
 import { Manager } from "../src/manager.ts";
-import { capOutput, readJson, uniqueName, writeJson, type Activity, type Completion, type Job, type Loadout } from "../src/shared.ts";
+import { capOutput, readJson, uniqueName, writeJson, type Activity, type Completion, type Job, type Loadout, type Mail, type MessageDelivery } from "../src/shared.ts";
 import { quote, Tmux, type Pane } from "../src/tmux.ts";
 
 const loadout: Loadout = { agent: "worker", tools: ["read"], extensions: [], systemPrompt: "Be useful.", thinking: "low", cwd: tmpdir(), model: "test/mock", approveProject: false };
@@ -129,6 +129,26 @@ test("completions survive reload without duplicate parent notifications", (t) =>
   assert.equal(restored.get(job.name).result?.text, "Completed.");
 });
 
+test("message delivery defaults to steering and persists explicit modes across manager reloads", (t) => {
+  const { manager, options } = setup(t);
+  const job = manager.spawn(loadout, "Task");
+  const mailbox = join(job.directory, "mailbox");
+  const mail = () => readdirSync(mailbox).sort().map((file) => readJson<Mail>(join(mailbox, file))!);
+  assert.deepEqual(mail(), [{ message: "Task", deliverAs: "steer" }]);
+  consume(job);
+  manager.message(job.name, "Default");
+  manager.message(job.name, "Explicit steering", "steer");
+  const restored = new Manager(options);
+  restored.message(job.name, "Deferred follow-up", "followUp");
+  assert.deepEqual(mail().sort((a, b) => a.message.localeCompare(b.message)), [
+    { message: "Default", deliverAs: "steer" },
+    { message: "Deferred follow-up", deliverAs: "followUp" },
+    { message: "Explicit steering", deliverAs: "steer" },
+  ]);
+  assert.throws(() => restored.message(job.name, "Invalid", "bad" as MessageDelivery), /deliverAs/);
+  assert.equal(mail().length, 3, "invalid modes must not enqueue mail");
+});
+
 test("follow-ups resume the same loadout/session and preserve earlier result paths", (t) => {
   const { manager, tmux } = setup(t);
   const job = manager.spawn(loadout, "Task");
@@ -136,7 +156,11 @@ test("follow-ups resume the same loadout/session and preserve earlier result pat
   manager.refresh();
   const oldRun = job.run;
   const session = job.sessionId;
-  manager.message(job.name, "Follow up\nwith literal newlines.");
+  manager.message(job.name, "Follow up\nwith literal newlines.", "followUp");
+  const mailbox = join(job.directory, "mailbox");
+  assert.deepEqual(readJson<Mail>(join(mailbox, readdirSync(mailbox)[0])), {
+    message: "Follow up\nwith literal newlines.", deliverAs: "followUp",
+  });
   assert.notEqual(job.run, oldRun);
   assert.equal(job.sessionId, session);
   assert.equal(manager.list()[0].resultFile, join(oldRun, "result.json"));
@@ -147,14 +171,18 @@ test("mail arriving at auto-exit is resumed without two session writers", (t) =>
   const { manager, tmux, results } = setup(t);
   const job = manager.spawn(loadout, "Task");
   consume(job);
-  manager.message(job.name, "Racing followup");
+  manager.message(job.name, "Racing followup", "followUp");
   const oldRun = job.run;
   finish(job, tmux, false);
   manager.refresh();
   assert.notEqual(job.run, oldRun);
   assert.equal(tmux.live.length, 1);
   assert.equal(results.length, 1);
-  assert.equal(readdirSync(join(job.directory, "mailbox")).length, 1);
+  const mailbox = join(job.directory, "mailbox");
+  assert.equal(readdirSync(mailbox).length, 1);
+  assert.deepEqual(readJson<Mail>(join(mailbox, readdirSync(mailbox)[0])), {
+    message: "Racing followup", deliverAs: "followUp",
+  });
 });
 
 test("unexpected pane loss is reported once and reused pane IDs are not owned", (t) => {

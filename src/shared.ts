@@ -86,7 +86,12 @@ export interface Completion {
 }
 
 export interface Control { keepOpen: boolean; cancel?: boolean }
-export interface Mail { message: string }
+export type MessageDelivery = "steer" | "followUp";
+export interface Mail {
+  message: string;
+  /** Missing on legacy mail; defaults to steering. */
+  deliverAs?: MessageDelivery;
+}
 
 export function writeJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });

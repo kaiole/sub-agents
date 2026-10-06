@@ -176,11 +176,15 @@ export default function (pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "subagent_message", label: "Message subagent",
-    description: "Send a message by task name. Steers a live agent without typing into its editor, or resumes its saved session if finished. Returns immediately; completion arrives automatically.",
-    parameters: Type.Object({ name: Type.String(), message: Type.String() }),
+    description: "Send a message by task name. steer (default) influences ongoing work; followUp waits until current work finishes. Both resume the saved session if idle or finished. Returns immediately. Completion is reported after queued work finishes, not separately for each message. Finalized tasks cannot resume.",
+    parameters: Type.Object({
+      name: Type.String(), message: Type.String(),
+      deliverAs: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")], { description: "steer (default): influence ongoing work. followUp: finish current work, then process this message before reporting completion." })),
+    }),
     async execute(_id, params, _signal, _update, ctx) {
-      const job = getManager(ctx).message(params.name, params.message);
-      return textResult(`Message queued for '${job.name}'.`, { name: job.name });
+      const deliverAs = params.deliverAs ?? "steer";
+      const job = getManager(ctx).message(params.name, params.message, deliverAs);
+      return textResult(`Message queued for '${job.name}' (${deliverAs}).`, { name: job.name, deliverAs });
     },
   });
   pi.registerTool({
