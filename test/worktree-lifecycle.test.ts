@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { parseDelegation } from "../index.ts";
 import { Manager } from "../src/manager.ts";
-import { readJson, writeJson, type Job, type Loadout } from "../src/shared.ts";
+import { readJson, writeJson, type Job, type Launch, type Loadout } from "../src/shared.ts";
 import { Tmux, type Pane } from "../src/tmux.ts";
 
 class FakeTmux extends Tmux {
@@ -53,6 +53,7 @@ test("editing workers default to HEAD worktrees; read-only workers share; overri
   writeFileSync(join(repo, "file.txt"), "unfinished\n");
   const worker = manager.spawn(loadout, "Edit code");
   assert.equal(worker.worktree?.baseline, "head");
+  assert.equal(readJson<Launch>(join(worker.run, "launch.json"))?.isolation, "worktree");
   assert.notEqual(worker.loadout.cwd, repo);
   assert.equal(readFileSync(join(worker.loadout.cwd, "file.txt"), "utf8"), "baseline\n");
   assert.equal(worker.loadout.approveProject, false);
@@ -60,6 +61,7 @@ test("editing workers default to HEAD worktrees; read-only workers share; overri
   assert.match(readFileSync(join(worker.directory, "system-prompt.md"), "utf8"), /Do not use the shared Git stash/);
   const scout = manager.spawn({ ...loadout, tools: ["read", "grep", "find", "ls"] }, "Read code", "scout");
   assert.equal(scout.worktree, undefined);
+  assert.equal(readJson<Launch>(join(scout.run, "launch.json"))?.isolation, "shared");
   assert.equal(scout.loadout.cwd, repo);
   const shared = manager.spawn(loadout, "Explicit sharing", "shared", false, { isolation: "shared" });
   assert.equal(shared.worktree, undefined);
@@ -93,6 +95,7 @@ test("worktree survives completion, reload, and revisions until explicit integra
   restored.message(job.name, "Revise");
   assert.equal(saved.loadout.cwd, job.loadout.cwd);
   assert.notEqual(saved.run, job.run);
+  assert.equal(readJson<Launch>(join(saved.run, "launch.json"))?.isolation, "worktree");
   writeFileSync(join(saved.loadout.cwd, "new.txt"), "worker revised\n");
   stopped(saved);
   const review = restored.diff(saved.name);

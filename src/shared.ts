@@ -60,6 +60,8 @@ export interface Launch {
   mailbox: string;
   inspection: boolean;
   inspectionStatus?: Status;
+  /** Optional for launch snapshots created before worker footers were introduced. */
+  isolation?: "worktree" | "shared";
 }
 
 export interface Activity {

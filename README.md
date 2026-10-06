@@ -36,6 +36,14 @@ Spawning never changes the parent's focus or layout. Results automatically arriv
 
 Tmux's window chooser (`prefix + w`) also works, but **does not pin** a worker. Use the `open` command when you need it to stay available. In a worker, `/subagents keep` pins it manually. Killing a tmux window terminates its worker; hiding it means switching away, not closing it.
 
+Workers have their own footer; the parent's normal footer is unchanged:
+
+```text
+ [fix-auth:worker] worktree | gpt-6.1-sol • high | 3% [8.7k/272k]                    pinned
+```
+
+The left shows [task:profile], isolation, model/thinking, and context usage. The right shows `auto-exit` or `pinned`, with no path or branch. Task/profile and keep-open behavior use `muted`; isolation uses `thinkingLow`. Context percentages always use `thinkingLow`, including high or unknown usage. Details are muted and separators use `thinkingLow`. Left-side details truncate before isolation/lifecycle details; legacy launch snapshots without isolation metadata show `[unknown]`. Keep/release changes from either parent or worker refresh the footer automatically.
+
 Normal completion and provider failure auto-exit unless pinned. An interactive Escape/abort keeps the worker open for recovery; release or cancel it when done. Worker `/new`, `/resume`, and `/fork` are blocked so its recorded session identity stays intact.
 
 Workers survive parent quit, reload, and session switches. Their results are delivered when that parent session is resumed. Detached workers still auto-exit on completion; intentionally kept-open workers need to be released/cancelled or quit directly.

@@ -102,6 +102,7 @@ export class Manager {
       name: job.name, sessionId: job.sessionId, loadout: job.loadout,
       parentPane: this.options.parentPane, mailbox: this.mailbox(job), inspection,
       inspectionStatus: inspection ? job.status : undefined,
+      isolation: job.worktree ? "worktree" : "shared",
     };
     writeJson(join(run, "launch.json"), launch);
     writeJson(join(run, "control.json"), { keepOpen } satisfies Control);

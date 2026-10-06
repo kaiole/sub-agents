@@ -93,6 +93,10 @@ test("real Pi workers use background windows, complete, resume, inspect, steer, 
   await manager.open(first.name);
   assert.equal(tmux.command(["display-message", "-p", "-t", "test:", "#{window_id}"]), first.windowId);
   assert.equal(readJson<Activity>(join(first.run, "activity.json"))?.keepOpen, true);
+  await waitFor(() => {
+    const screen = tmux.command(["capture-pane", "-p", "-t", first.paneId!]);
+    return screen.split("\n").some((line) => /\[test:test\] shared \| mock \| /.test(line) && line.trimEnd().endsWith(" pinned"));
+  }, () => diagnose(first));
   assert.notEqual(first.resultFile, join(first.run, "result.json"));
   assert.notEqual(first.resultFile, oldResult);
   manager.release(first.name);

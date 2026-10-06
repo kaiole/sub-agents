@@ -3,17 +3,19 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { childExtension } from "../src/child.ts";
 import { readJson, writeJson, type Activity, type Completion, type Launch } from "../src/shared.ts";
 
 type Handler = (event: Record<string, unknown>, ctx: ExtensionContext) => unknown;
+type FooterFactory = NonNullable<Parameters<ExtensionContext["ui"]["setFooter"]>[0]>;
 
 /** Capture the extension boundary; never start Pi, tmux, or a provider request. */
 class FakePi {
   handlers = new Map<string, Handler[]>();
   tools = new Map<string, ToolDefinition>();
   activeTools: string[] = [];
+  commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
   sent: Array<{ message: string; options: unknown }> = [];
   on(name: string, handler: Handler) {
     const handlers = this.handlers.get(name) ?? [];
@@ -22,7 +24,8 @@ class FakePi {
     return () => {};
   }
   registerTool(tool: ToolDefinition) { this.tools.set(tool.name, tool); }
-  registerCommand() {}
+  registerCommand(name: string, command: Parameters<ExtensionAPI["registerCommand"]>[1]) { this.commands.set(name, command); }
+  getThinkingLevel() { return "off"; }
   getAllTools() { return [{ name: "read", exposure: "direct" }, ...this.tools.values()]; }
   setActiveTools(tools: string[]) { this.activeTools = tools; }
   sendUserMessage(message: string, options: unknown) { this.sent.push({ message, options }); }
@@ -31,7 +34,7 @@ class FakePi {
   }
 }
 
-function setup(t: test.TestContext, options: { keepOpen?: boolean; inspection?: boolean; question?: string } = {}) {
+function setup(t: test.TestContext, options: { keepOpen?: boolean; inspection?: boolean; question?: string; isolation?: Launch["isolation"] } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "pi-subagents-child-"));
   const run = join(directory, "run");
   const mailbox = join(directory, "mailbox");
@@ -39,6 +42,7 @@ function setup(t: test.TestContext, options: { keepOpen?: boolean; inspection?: 
   const sessionFile = join(directory, "session.jsonl");
   const launch: Launch = {
     name: "worker", sessionId: "saved-session", mailbox, inspection: options.inspection ?? false,
+    isolation: options.isolation ?? "shared",
     loadout: { agent: "worker", tools: ["read"], extensions: [], systemPrompt: "", thinking: "off", cwd: directory, approveProject: false },
   };
   writeJson(join(run, "launch.json"), launch);
@@ -63,15 +67,29 @@ function setup(t: test.TestContext, options: { keepOpen?: boolean; inspection?: 
     let aborts = 0;
     let isIdle = true;
     let pendingMessages = false;
+    let footer: ReturnType<FooterFactory>;
+    let footerRenders = 0;
     const ctx = {
-      mode: "tui", sessionManager: { getSessionFile: () => sessionFile },
-      ui: { setStatus() {}, notify() {} },
+      mode: "tui", getContextUsage: () => undefined,
+      sessionManager: { getSessionFile: () => sessionFile, getCwd: () => directory },
+      ui: {
+        setFooter(factory: FooterFactory) {
+          footer = factory(
+            { requestRender: () => { footerRenders++; } } as Parameters<FooterFactory>[0],
+            { fg: (_color: string, text: string) => text } as Parameters<FooterFactory>[1],
+            { getGitBranch: () => "main", onBranchChange: () => () => {}, getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1 } as Parameters<FooterFactory>[2],
+          );
+        },
+        notify() {},
+      },
       isIdle: () => isIdle, hasPendingMessages: () => pendingMessages,
       shutdown: () => { shutdowns++; }, abort: () => { aborts++; },
     } as unknown as ExtensionContext;
     childExtension(pi as unknown as ExtensionAPI, run);
     const worker = {
       pi, ctx,
+      footer: () => footer.render(200)[0],
+      get footerRenders() { return footerRenders; },
       emit: (name: string, event: Record<string, unknown> = {}) => pi.emit(name, ctx, event),
       ask: (question: string) => pi.tools.get("ask_question")!.execute("ask-1", { question }, undefined, undefined, ctx as ExtensionToolContext),
       start() { isIdle = false; pi.emit("agent_start", ctx); },
@@ -108,6 +126,35 @@ function setup(t: test.TestContext, options: { keepOpen?: boolean; inspection?: 
 function assistant(text: string, errorMessage?: string) {
   return { message: { role: "assistant", content: [{ type: "text", text }], errorMessage } };
 }
+
+test("worker footer reflects parent pinning and abort recovery without duplicate status text", (t) => {
+  const h = setup(t, { isolation: "worktree" });
+  assert.match(h.footer(), /^ \[worker:worker\] worktree \| no-model \| \?% \[\?\/0\]/);
+  assert.match(h.footer(), / auto-exit$/);
+  const renders = h.worker.footerRenders;
+  writeJson(join(h.run, "control.json"), { keepOpen: true });
+  h.tick();
+  assert.match(h.footer(), / pinned$/);
+  assert.equal(h.worker.footerRenders, renders + 1);
+  h.advance(6000);
+  h.tick();
+  assert.equal(h.worker.footerRenders, renders + 1, "unchanged heartbeats do not redraw the footer");
+  writeJson(join(h.run, "control.json"), { keepOpen: false });
+  h.tick();
+  assert.match(h.footer(), / auto-exit$/);
+  h.worker.start();
+  h.worker.settle("aborted");
+  assert.match(h.footer(), / pinned$/, "abort pins the footer immediately");
+});
+
+test("worker keep/release commands refresh the footer immediately", async (t) => {
+  const h = setup(t);
+  const command = h.pi.commands.get("subagents")!;
+  await command.handler("keep", h.ctx as ExtensionCommandContext);
+  assert.match(h.footer(), / pinned$/);
+  await command.handler("release", h.ctx as ExtensionCommandContext);
+  assert.match(h.footer(), / auto-exit$/);
+});
 
 test("ask_question is automatically registered and activated as a sequential model-only tool", (t) => {
   const h = setup(t);

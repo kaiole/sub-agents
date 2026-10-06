@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import { readJson, writeJson, type Activity, type Completion, type Control, type Launch, type Mail, type WaitingFor } from "./shared.ts";
 import { Tmux } from "./tmux.ts";
 import { readActivity } from "./health.ts";
+import { installWorkerFooter } from "./worker-footer.ts";
 
 /** Runs inside the worker's actual interactive Pi process. No stdin/send-keys automation. */
 export function childExtension(pi: ExtensionAPI, run: string): void {
@@ -29,6 +30,7 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
   let pendingQuestion = readJson<{ question: string }>(questionFile)?.question;
   let lastHeartbeat = 0;
   let lastKeepOpen: boolean | undefined;
+  let refreshFooter = () => {};
   let usage: Completion["usage"] = emptyUsage();
   const outbox = join(run, "results");
   let completionSequence = existsSync(outbox) ? readdirSync(outbox).length : 0;
@@ -37,12 +39,13 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
   function control(): Control { return readJson<Control>(join(run, "control.json")) ?? { keepOpen: false }; }
   function heartbeat(): void {
     lastHeartbeat = Date.now();
+    const previousKeepOpen = lastKeepOpen;
     lastKeepOpen = control().keepOpen;
     writeJson(join(run, "activity.json"), {
       status, detail, since: activitySince, waitingFor,
       pid: process.pid, sessionFile: ctx.sessionManager.getSessionFile(), updatedAt: lastHeartbeat, keepOpen: lastKeepOpen,
     } satisfies Activity);
-    ctx.ui.setStatus("subagent", `${launch!.name} · ${lastKeepOpen ? "kept open" : "auto-exit"}`);
+    if (previousKeepOpen !== lastKeepOpen) refreshFooter();
   }
   function activity(next: Activity["status"], text: string, reason?: WaitingFor): void {
     if (status !== next || detail !== text || waitingFor !== reason) activitySince = Date.now();
@@ -120,6 +123,7 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
       return;
     }
     pi.setActiveTools([...activeTools]);
+    refreshFooter = installWorkerFooter(pi, ctx, launch, () => lastKeepOpen ?? false);
     if (idle) {
       activity("waiting", pendingQuestion ? "clarification" : launch.inspection ? "inspection" : previousActivity?.detail ?? "finished",
         pendingQuestion ? "clarification" : launch.inspection ? "inspection" : previousActivity?.waitingFor ?? "release");
@@ -167,15 +171,16 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
       lastAssistant?.errorMessage || text || (resultStatus === "done" ? "(No final text.)" : `Worker ${resultStatus}.`),
       resultStatus === "needs-input" ? pendingQuestion : undefined);
     idle = true;
-    activity("waiting", resultStatus === "needs-input" ? "clarification" : resultStatus === "done" ? "finished" : resultStatus,
-      resultStatus === "needs-input" ? "clarification" : resultStatus === "cancelled" ? "human-input" : "release");
     // After an interactive Escape/abort, leave the live TUI available for recovery.
     if (resultStatus === "cancelled") writeJson(join(run, "control.json"), { keepOpen: true });
+    activity("waiting", resultStatus === "needs-input" ? "clarification" : resultStatus === "done" ? "finished" : resultStatus,
+      resultStatus === "needs-input" ? "clarification" : resultStatus === "cancelled" ? "human-input" : "release");
     // Do not shut down synchronously in the settlement callback. Drain any racing messages first.
   });
   pi.on("session_shutdown", (event) => {
     if (timer) clearInterval(timer);
     timer = undefined;
+    refreshFooter = () => {};
     if (!closing && !idle && event.reason !== "reload") complete("cancelled", "Worker exited before completing its task.");
     closing = true;
   });
@@ -206,6 +211,7 @@ export function childExtension(pi: ExtensionAPI, run: string): void {
       const action = args.trim();
       if (action === "keep" || action === "release") {
         writeJson(join(run, "control.json"), { keepOpen: action === "keep" });
+        heartbeat();
         context.ui.notify(action === "keep" ? "Worker will stay open." : "Worker will exit when idle.", "info");
       } else if (action === "parent" && launch.parentPane) {
         try { new Tmux().open(launch.parentPane); }
