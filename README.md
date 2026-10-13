@@ -4,7 +4,7 @@ Async workers in **unselected tmux windows**, not splits or new tmux sessions. E
 
 ## Install and try
 
-Tested with Pi 1.0.2 and tmux 3.7c. Requires the `agent_settled` extension lifecycle, tmux with `new-window -e`, and Bash. Isolated editing additionally requires Git with `merge-tree --write-tree` support (Git 2.38+) and a repository with an existing commit.
+Tested with Pi 1.2.0 and tmux 3.7c. Requires the `agent_settled` extension lifecycle, tmux with `new-window -e`, and Bash. Isolated editing additionally requires Git with `merge-tree --write-tree` support (Git 2.38+) and a repository with an existing commit.
 
 ```sh
 pi install ~/dotfiles/pi/picosystem/sub-agents
@@ -229,9 +229,13 @@ The window runs its launch script directly, avoiding interactive-shell startup r
 ## Development
 
 ```sh
-npm install
+npm ci
 npm run typecheck
 npm test
 ```
 
-The tests include real Pi TUI workers on an isolated tmux socket with an offline mock provider: no API calls, charges, or changes to your live tmux layout. They cover async completion, clarification/answer round trips without extra model turns, preloaded skill startup/resume, follow-ups, steering, inspection, cancellation, errors, loadout persistence, real isolated writes/integration, and parent notification/tool wiring. Real-Git unit tests cover snapshots, dirty-checkout integration, conflict refusal, index preservation and worktree lifecycle. Deterministic unit tests cover skill discovery/trust/snapshots, activity timing, and heartbeat stall/recovery transitions. Pi's host packages are peer dependencies and must be available for development.
+Pi's host packages remain runtime peer dependencies. Development also installs exact versions locally, recorded with their transitive dependencies in `package-lock.json`; no symlinks into the managed Pi installation are needed. Upgrading the installed Pi does not affect this checkout's typechecking or tests. `npm test` uses the locally installed Pi CLI, not the global installation. Node.js 22.19+ is required; tmux is required for the real-worker integration test (otherwise that test is skipped).
+
+To test against a newer Pi release, deliberately update all four `@earendil-works/pi-*` development dependencies together using `npm install --save-dev --save-exact`, and update `typebox` to the version used by that release. Run typechecking and the full test suite, then commit both `package.json` and `package-lock.json`. Keep the runtime peer ranges at `"*"`; do not move host packages into `dependencies`.
+
+The tests include real Pi TUI workers on an isolated tmux socket with an offline mock provider: no API calls, charges, or changes to your live tmux layout. They cover async completion, clarification/answer round trips without extra model turns, preloaded skill startup/resume, follow-ups, steering, inspection, cancellation, errors, loadout persistence, real isolated writes/integration, and parent notification/tool wiring. Real-Git unit tests cover snapshots, dirty-checkout integration, conflict refusal, index preservation and worktree lifecycle. Deterministic unit tests cover skill discovery/trust/snapshots, activity timing, and heartbeat stall/recovery transitions.
